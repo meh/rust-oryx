@@ -1,18 +1,18 @@
 use chrono::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json as json;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Response {
     pub data: Data,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Data {
     pub layout: Layout,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Layout {
     #[serde(rename = "hashId")]
     pub hash_id: String,
@@ -38,7 +38,7 @@ pub struct Layout {
     pub is_latest_revision: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     #[serde(rename = "hashId")]
     pub hash_id: String,
@@ -52,7 +52,7 @@ pub struct User {
     pub picture_url: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Revision {
     #[serde(rename = "hashId")]
     pub hash_id: String,
@@ -89,12 +89,12 @@ pub struct Revision {
     pub layers: Vec<Layer>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Swatch {
     pub colors: Vec<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub uk: bool,
     #[serde(rename = "audioClick")]
@@ -115,7 +115,7 @@ pub struct Config {
     pub enable_dynamic_macros: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Layer {
     #[serde(rename = "hashId")]
     pub hash_id: String,
@@ -131,7 +131,7 @@ pub struct Layer {
     pub keys: Vec<Key>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Key {
     #[serde(default)]
     pub about: Option<String>,
@@ -158,7 +158,7 @@ pub struct Key {
     pub double_tap: Option<Mode>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Mode {
     pub code: String,
     #[serde(default)]

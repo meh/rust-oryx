@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::path::PathBuf;  // used by layout_cache_path
 
 use crossterm::{
     event::{Event as CEvent, EventStream, KeyCode, KeyModifiers},
@@ -254,7 +255,7 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     let fg = if is_transparent(effective) {
         Color::DarkGray
     } else {
-        Color::White
+        Color::Indexed(15) // bright white from 256-color palette
     };
     let style = Style::default().fg(fg);
     match effective.glow_color.as_deref().and_then(parse_hex_color) {
@@ -626,6 +627,46 @@ fn draw(f: &mut Frame, app: &App) {
     );
 }
 
+// ── Layout caching ────────────────────────────────────────────────────────────
+
+fn layout_cache_path(hash_id: &str, revision_id: &str) -> Option<PathBuf> {
+    dirs::cache_dir().map(|p| {
+        p.join("oryx-look")
+            .join(format!("{}_{}.json", hash_id, revision_id))
+    })
+}
+
+async fn fetch_layout_cached(
+    hash_id: &str,
+    revision_id: &str,
+    geometry: &str,
+) -> anyhow::Result<layout::Response> {
+    let cache_path = layout_cache_path(hash_id, revision_id);
+
+    if let Some(ref path) = cache_path {
+        if let Ok(data) = tokio::fs::read(path).await {
+            if let Ok(response) = serde_json::from_slice::<layout::Response>(&data) {
+                return Ok(response);
+            }
+        }
+    }
+
+    let response = layout::fetch(hash_id, revision_id, geometry)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if let Some(ref path) = cache_path {
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Ok(data) = serde_json::to_vec(&response) {
+            let _ = tokio::fs::write(path, data).await;
+        }
+    }
+
+    Ok(response)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -653,16 +694,16 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let _ = tx.send(Msg::StatusUpdate(format!(
-                "Fetching {}/{}…",
+                "Loading layout {}/{}…",
                 firmware.layout, firmware.revision
             )));
 
-            match layout::fetch(&firmware.layout, &firmware.revision, "moonlander").await {
+            match fetch_layout_cached(&firmware.layout, &firmware.revision, "moonlander").await {
                 Ok(response) => {
                     let _ = tx.send(Msg::LayoutLoaded(Box::new(response)));
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::StatusUpdate(format!("Fetch failed: {e}")));
+                    let _ = tx.send(Msg::StatusUpdate(format!("Layout load failed: {e}")));
                 }
             }
 
