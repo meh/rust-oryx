@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
 oryx-hid = { path = "../hid" }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

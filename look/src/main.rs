@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf; // used by layout_cache_path
 
+use clap::Parser;
 use crossterm::{
     event::{Event as CEvent, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -19,7 +20,25 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-const DARK_RED: Color = Color::Rgb(160, 20, 20);
+#[derive(Parser)]
+#[command(about = "Visualize your ZSA keyboard layout")]
+struct Cli {
+    /// Accent color for layer tabs as #RRGGBB hex (env: ORYX_ACCENT)
+    #[arg(long, env = "ORYX_ACCENT", value_parser = parse_color, default_value = "#b21818")]
+    accent: Color,
+}
+
+fn parse_color(s: &str) -> Result<Color, String> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).map_err(|e| e.to_string())?;
+        let g = u8::from_str_radix(&s[2..4], 16).map_err(|e| e.to_string())?;
+        let b = u8::from_str_radix(&s[4..6], 16).map_err(|e| e.to_string())?;
+        Ok(Color::Rgb(r, g, b))
+    } else {
+        Err(format!("expected #RRGGBB hex color, got {:?}", s))
+    }
+}
 
 // ── Key label helpers ─────────────────────────────────────────────────────────
 
@@ -575,16 +594,16 @@ impl App {
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &App, accent_color: Color) {
     let chunks = TLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(f.area());
 
-    let accent = Style::default().fg(DARK_RED);
+    let accent = Style::default().fg(accent_color);
     let highlight = Style::default()
         .fg(Color::White)
-        .bg(DARK_RED)
+        .bg(accent_color)
         .add_modifier(Modifier::BOLD);
 
     if let Some(ref response) = app.layout_data {
@@ -597,8 +616,10 @@ fn draw(f: &mut Frame, app: &App) {
                     let name = l.title.as_deref().unwrap_or("?");
                     if i == app.active_layer {
                         Line::from(Span::styled(
-                            format!(" ● {} ", name),
-                            Style::default().fg(DARK_RED).add_modifier(Modifier::BOLD),
+                            format!(" {} ", name),
+                            Style::default()
+                                .fg(accent_color)
+                                .add_modifier(Modifier::BOLD),
                         ))
                     } else {
                         Line::from(format!("  {}  ", name))
@@ -641,7 +662,7 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(app.status.as_str())
             .block(Block::default().borders(Borders::ALL).title(" oryx_hid "))
-            .style(Style::default().fg(DARK_RED)),
+            .style(Style::default().fg(accent_color)),
         chunks[1],
     );
 }
@@ -690,6 +711,9 @@ async fn fetch_layout_cached(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let accent_color = cli.accent;
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
     tokio::spawn({
@@ -766,7 +790,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = async {
         loop {
-            terminal.draw(|f| draw(f, &app))?;
+            terminal.draw(|f| draw(f, &app, accent_color))?;
             tokio::select! {
                 Some(msg) = rx.recv() => {
                     app.apply(msg);
