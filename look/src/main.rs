@@ -1,21 +1,21 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;  // used by layout_cache_path
+use std::path::PathBuf; // used by layout_cache_path
 
 use crossterm::{
     event::{Event as CEvent, EventStream, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_lite::StreamExt as _;
 use oryx_hid::{asynchronous::OryxKeyboard, layout};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout as TLayout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
-    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
@@ -200,10 +200,9 @@ fn mode_label(m: &layout::Mode) -> String {
 fn is_transparent(key: &layout::Key) -> bool {
     key.custom_label.is_none()
         && key.hold.is_none()
-        && key
-            .tap
-            .as_ref()
-            .map_or(true, |m| matches!(m.code.as_str(), "KC_TRANSPARENT" | "KC_TRNS"))
+        && key.tap.as_ref().map_or(true, |m| {
+            matches!(m.code.as_str(), "KC_TRANSPARENT" | "KC_TRNS")
+        })
 }
 
 fn key_label(key: &layout::Key, base_key: Option<&layout::Key>) -> String {
@@ -244,7 +243,7 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     if pressed {
         return Style::default()
             .fg(Color::Black)
-            .bg(DARK_RED)
+            .bg(Color::White)
             .add_modifier(Modifier::BOLD);
     }
     let effective = if is_transparent(key) {
@@ -255,7 +254,7 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     let fg = if is_transparent(effective) {
         Color::DarkGray
     } else {
-        Color::Indexed(15) // bright white from 256-color palette
+        Color::White
     };
     let style = Style::default().fg(fg);
     match effective.glow_color.as_deref().and_then(parse_hex_color) {
@@ -277,12 +276,12 @@ fn matrix_to_index(row: u8, col: u8) -> Option<usize> {
         (3, c @ 0..=5) => Some(21 + c as usize),
         (4, c @ 0..=4) => Some(27 + c as usize),
         (5, c @ 0..=2) => Some(33 + c as usize), // left thumb: col0=outer, col1=mid, col2=inner
-        (5, 3) => Some(32),                        // left thumb: col3=wide key
+        (5, 3) => Some(32),                      // left thumb: col3=wide key
         (r @ 6..=8, c @ 0..=6) => Some(36 + (r as usize - 6) * 7 + c as usize),
-        (9, c @ 1..=6) => Some(56 + c as usize),   // right 1×6: col0 missing (tower), col1-6 → 57-62
-        (10, c @ 2..=6) => Some(61 + c as usize),  // right 1×5: col0-1 missing, col2-6 → 63-67
-        (11, 3) => Some(68),                         // right thumb: col3=wide key (inner)
-        (11, c @ 4..=6) => Some(65 + c as usize),  // right thumb: col4-6=small → 69,70,71
+        (9, c @ 1..=6) => Some(56 + c as usize), // right 1×6: col0 missing (tower), col1-6 → 57-62
+        (10, c @ 2..=6) => Some(61 + c as usize), // right 1×5: col0-1 missing, col2-6 → 63-67
+        (11, 3) => Some(68),                     // right thumb: col3=wide key (inner)
+        (11, c @ 4..=6) => Some(65 + c as usize), // right thumb: col4-6=small → 69,70,71
         _ => None,
     }
 }
@@ -391,9 +390,19 @@ fn render_keyboard(
     )));
     {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.extend(content_line(keys, base_keys, &[21, 22, 23, 24, 25, 26], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[21, 22, 23, 24, 25, 26],
+            pressed,
+        ));
         spans.push(Span::raw(ROW3_GAP));
-        spans.extend(content_line(keys, base_keys, &[57, 58, 59, 60, 61, 62], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[57, 58, 59, 60, 61, 62],
+            pressed,
+        ));
         lines.push(Line::from(spans));
     }
     // Transition: 1×6 bottom / 1×5 top merged
@@ -406,9 +415,19 @@ fn render_keyboard(
     )));
     {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.extend(content_line(keys, base_keys, &[27, 28, 29, 30, 31], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[27, 28, 29, 30, 31],
+            pressed,
+        ));
         spans.push(Span::raw(ROW4_GAP));
-        spans.extend(content_line(keys, base_keys, &[63, 64, 65, 66, 67], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[63, 64, 65, 66, 67],
+            pressed,
+        ));
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(format!(
@@ -564,7 +583,7 @@ fn draw(f: &mut Frame, app: &App) {
 
     let accent = Style::default().fg(DARK_RED);
     let highlight = Style::default()
-        .fg(Color::Black)
+        .fg(Color::White)
         .bg(DARK_RED)
         .add_modifier(Modifier::BOLD);
 
