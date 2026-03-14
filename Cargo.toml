@@ -1,0 +1,3 @@
+[workspace]
+members = ["ctl", "hid", "look"]
+resolver = "2"
