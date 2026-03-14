@@ -232,16 +232,13 @@ fn key_label(key: &layout::Key, base_key: Option<&layout::Key>) -> String {
         let s: String = s.chars().take(4).collect();
         return format!("{:^4}", s);
     }
-    if let Some(ref m) = key.tap {
+    for m in [&key.tap, &key.hold, &key.tap_hold, &key.double_tap]
+        .into_iter()
+        .flatten()
+    {
         let label = mode_label(m);
         if label.trim() != "" {
             return label;
-        }
-    }
-    if let Some(ref m) = key.hold {
-        let label = mode_label(m);
-        if label.trim() != "" {
-            return format!("[{:^2}]", label.trim().chars().take(2).collect::<String>());
         }
     }
     "    ".into()
@@ -275,7 +272,16 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     } else {
         Color::White
     };
-    let style = Style::default().fg(fg);
+    let mut style = Style::default().fg(fg);
+    if effective.hold.is_some() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if effective.double_tap.is_some() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if effective.tap_hold.is_some() {
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
     match effective.glow_color.as_deref().and_then(parse_hex_color) {
         Some(bg) => style.bg(bg),
         None => style,
