@@ -115,6 +115,7 @@ struct ModeCache {
     ngram_count: Option<usize>,
     code_lang: Option<usize>,
     code_prompt: Option<String>,
+    flash_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -478,23 +479,49 @@ fn generate_flash_sequence(flash_chars: &[char], len: usize) -> String {
         return String::new();
     }
     let mut rng = rand::rng();
-    let mut result = Vec::with_capacity(len);
-    let mut last = '\0';
-    for _ in 0..len {
-        let ch = if flash_chars.len() == 1 {
-            flash_chars[0]
-        } else {
-            loop {
-                let c = flash_chars[rng.random_range(0..flash_chars.len())];
-                if c != last {
-                    break c;
+
+    // Build a base that guarantees every key appears at least once.
+    // Repeat the shuffled set enough times to fill `len`, then truncate.
+    let mut base: Vec<char> = Vec::with_capacity(len);
+    while base.len() < len {
+        let mut chunk: Vec<char> = flash_chars.to_vec();
+        // Fisher-Yates shuffle
+        for i in (1..chunk.len()).rev() {
+            let j = rng.random_range(0..=i);
+            chunk.swap(i, j);
+        }
+        base.extend_from_slice(&chunk);
+    }
+    base.truncate(len);
+
+    // Fix consecutive duplicates caused by chunk boundaries.
+    if flash_chars.len() > 1 {
+        for i in 1..base.len() {
+            if base[i] == base[i - 1] {
+                // Swap with the next element that differs, or pick a random one.
+                let mut swapped = false;
+                for j in (i + 1)..base.len() {
+                    if base[j] != base[i - 1] && (j + 1 >= base.len() || base[j] != base[i]) {
+                        base.swap(i, j);
+                        swapped = true;
+                        break;
+                    }
+                }
+                if !swapped {
+                    // Fall back: pick any char != previous
+                    loop {
+                        let c = flash_chars[rng.random_range(0..flash_chars.len())];
+                        if c != base[i - 1] {
+                            base[i] = c;
+                            break;
+                        }
+                    }
                 }
             }
-        };
-        last = ch;
-        result.push(ch);
+        }
     }
-    result.into_iter().collect()
+
+    base.into_iter().collect()
 }
 
 // ── Keymap (keyboard layout) ──────────────────────────────────────────────────
@@ -529,12 +556,12 @@ impl Keymap {
         None
     }
 
-    /// All printable chars across every layer (union, deduped).
+    /// All visible printable chars across every layer (union, deduped).
     fn all_printable_chars(&self) -> Vec<char> {
         let mut seen = HashMap::new();
         for layer in &self.layers {
             for &ch in layer.keys() {
-                if !ch.is_control() {
+                if !ch.is_control() && !ch.is_whitespace() {
                     seen.insert(ch, ());
                 }
             }
@@ -1047,6 +1074,7 @@ struct ConfigState {
     ngram_kind: usize,
     ngram_count: usize,
     symbol_len: usize,
+    flash_count: usize,
     prompt_buf: String,
     prompt_cursor: usize,
     sample_idx: usize,
@@ -1062,7 +1090,7 @@ impl ConfigState {
     fn option_count(&self) -> usize {
         match self.mode {
             Mode::Prose | Mode::Words => 2,
-            Mode::Flash => 0,
+            Mode::Flash => 1,
             Mode::Symbols => 1,
             Mode::Ngrams => 2,
             Mode::Code => 1,
@@ -1086,7 +1114,7 @@ impl ConfigState {
                 ("Language", LANGUAGES[self.lang_idx].name.to_string()),
                 ("Words", self.word_count.to_string()),
             ],
-            Mode::Flash => vec![],
+            Mode::Flash => vec![("Keys", self.flash_count.to_string())],
             Mode::Symbols => vec![("Length", self.symbol_len.to_string())],
             Mode::Ngrams => vec![
                 ("Type", NGRAM_KINDS[self.ngram_kind].to_string()),
@@ -1114,6 +1142,9 @@ impl ConfigState {
             }
             (Mode::Words, 1) => {
                 self.word_count = (self.word_count as i32 + delta * 10).clamp(10, 500) as usize;
+            }
+            (Mode::Flash, 0) => {
+                self.flash_count = (self.flash_count as i32 + delta * 10).clamp(10, 500) as usize;
             }
             (Mode::Symbols, 0) => {
                 self.symbol_len = (self.symbol_len as i32 + delta * 10).clamp(10, 300) as usize;
@@ -1939,7 +1970,7 @@ fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
                 app.status_msg = "No printable keys found in keyboard layout.".into();
                 return;
             }
-            let text = generate_flash_sequence(&flash_chars, 100);
+            let text = generate_flash_sequence(&flash_chars, app.cfg.flash_count);
             app.typing = Some(TypingSession::new_local(text, Mode::Flash, "Flash".into()));
             app.screen = Screen::Typing;
             update_kbd_led(app);
@@ -2173,6 +2204,7 @@ async fn main() -> Result<()> {
             ngram_kind: cache.ngram_kind.unwrap_or(2),
             ngram_count: cache.ngram_count.unwrap_or(50),
             symbol_len: cache.symbol_length.unwrap_or(80),
+            flash_count: cache.flash_count.unwrap_or(100),
             prompt_buf,
             prompt_cursor,
             sample_idx: 0,
@@ -2543,6 +2575,7 @@ async fn main() -> Result<()> {
             ngram_count: Some(cfg.ngram_count),
             code_lang: Some(cfg.code_lang_idx),
             code_prompt: Some(code_p),
+            flash_count: Some(cfg.flash_count),
         };
         let _ = save_config(&config_path, &persisted_config);
     }
