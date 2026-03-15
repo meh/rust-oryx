@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -85,7 +86,7 @@ const SYMBOLS: &str = "!@#$%^&*()_+-=[]{}|;':\",./<>?`~";
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Config {
     #[serde(default)]
     llm: LlmConfig,
@@ -93,7 +94,7 @@ struct Config {
     train: TrainConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct LlmConfig {
     provider: Option<String>,
     model: Option<String>,
@@ -101,7 +102,22 @@ struct LlmConfig {
     base_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ModeCache {
+    last_mode: Option<String>,
+    lang: Option<usize>,
+    word_count: Option<usize>,
+    prose_infinite: Option<bool>,
+    prose_prompt: Option<String>,
+    words_prompt: Option<String>,
+    symbol_length: Option<usize>,
+    ngram_kind: Option<usize>,
+    ngram_count: Option<usize>,
+    code_lang: Option<usize>,
+    code_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TrainConfig {
     #[serde(default)]
     prompts: Vec<String>,
@@ -109,6 +125,8 @@ struct TrainConfig {
     accent_color: Option<String>,
     highlight_color: Option<String>,
     stats_window: Option<usize>,
+    #[serde(default)]
+    mode_cache: ModeCache,
 }
 
 fn parse_rgb(s: &str) -> Option<(u8, u8, u8)> {
@@ -137,6 +155,14 @@ fn load_config(path: &PathBuf) -> Config {
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn save_config(path: &PathBuf, config: &Config) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(config)?)?;
+    Ok(())
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -222,6 +248,25 @@ struct SessionStats {
     correct: usize,
     text_length: usize,
     prompt: String,
+    #[serde(default)]
+    avg_reaction_ms: Option<f64>,
+}
+
+// ── Per-mode stats path ───────────────────────────────────────────────────────
+
+fn stats_path(base: &PathBuf, mode: Mode) -> PathBuf {
+    let id = match mode {
+        Mode::Prose => "prose",
+        Mode::Words => "words",
+        Mode::Flash => "flash",
+        Mode::Symbols => "symbols",
+        Mode::Ngrams => "ngrams",
+        Mode::Code => "code",
+    };
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = base.extension().unwrap_or_default().to_string_lossy();
+    let name = format!("{stem}.{id}.{ext}");
+    base.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }
 
 fn save_stats(path: &PathBuf, stats: &SessionStats) -> Result<()> {
@@ -247,6 +292,69 @@ fn load_recent_stats(path: &PathBuf, n: usize) -> Vec<SessionStats> {
         .collect();
     let skip = all.len().saturating_sub(n);
     all.into_iter().skip(skip).collect()
+}
+
+// ── GohuFont BDF bitmap rendering ─────────────────────────────────────────────
+
+static GLYPHS: OnceLock<HashMap<char, Vec<u8>>> = OnceLock::new();
+
+fn glyphs() -> &'static HashMap<char, Vec<u8>> {
+    GLYPHS.get_or_init(|| parse_bdf(include_str!("../assets/gohufont-uni-11.bdf")))
+}
+
+fn parse_bdf(bdf: &str) -> HashMap<char, Vec<u8>> {
+    let mut map = HashMap::new();
+    let mut encoding: Option<u32> = None;
+    let mut in_bitmap = false;
+    let mut rows: Vec<u8> = Vec::new();
+    for line in bdf.lines() {
+        if let Some(rest) = line.strip_prefix("ENCODING ") {
+            encoding = rest
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .and_then(|n| if n >= 0 { Some(n as u32) } else { None });
+        } else if line == "BITMAP" {
+            in_bitmap = true;
+            rows.clear();
+        } else if line == "ENDCHAR" {
+            if let Some(enc) = encoding {
+                if let Some(ch) = char::from_u32(enc) {
+                    map.insert(ch, rows.clone());
+                }
+            }
+            in_bitmap = false;
+            encoding = None;
+        } else if in_bitmap {
+            if let Ok(byte) = u8::from_str_radix(line.trim(), 16) {
+                rows.push(byte);
+            }
+        }
+    }
+    map
+}
+
+/// Render a character as bitmap lines using the GohuFont glyph (6×11, 2× horizontal scale).
+fn render_glyph(ch: char, on_style: Style) -> Vec<Line<'static>> {
+    let glyph_map = glyphs();
+    let rows = match glyph_map.get(&ch) {
+        Some(r) => r.clone(),
+        None => return vec![Line::from(Span::styled(ch.to_string(), on_style))],
+    };
+    rows.iter()
+        .map(|&byte| {
+            let spans: Vec<Span<'static>> = (0..6)
+                .flat_map(|bit| {
+                    if byte & (0x80 >> bit) != 0 {
+                        vec![Span::styled("██", on_style)]
+                    } else {
+                        vec![Span::raw("  ")]
+                    }
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
 // ── Syntax highlighting (tree-sitter) ─────────────────────────────────────────
@@ -495,8 +603,8 @@ fn build_keymap(layout: &oryx_hid::Layout) -> Keymap {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
-    Finite,
-    Infinite,
+    Prose,
+    Words,
     Flash,
     Symbols,
     Ngrams,
@@ -505,8 +613,8 @@ enum Mode {
 
 impl Mode {
     const ALL: &'static [Mode] = &[
-        Mode::Finite,
-        Mode::Infinite,
+        Mode::Prose,
+        Mode::Words,
         Mode::Flash,
         Mode::Symbols,
         Mode::Ngrams,
@@ -515,8 +623,8 @@ impl Mode {
 
     fn name(self) -> &'static str {
         match self {
-            Mode::Finite => "Finite",
-            Mode::Infinite => "Infinite",
+            Mode::Prose => "Prose",
+            Mode::Words => "Words",
             Mode::Flash => "Flash",
             Mode::Symbols => "Symbols",
             Mode::Ngrams => "N-grams",
@@ -526,8 +634,8 @@ impl Mode {
 
     fn description(self) -> &'static str {
         match self {
-            Mode::Finite => "Type a set number of words",
-            Mode::Infinite => "LLM generates text continuously",
+            Mode::Prose => "LLM-generated prose text",
+            Mode::Words => "Plain words, no punctuation",
             Mode::Flash => "Press each displayed key",
             Mode::Symbols => "Practice typing symbols",
             Mode::Ngrams => "LLM-generated letter patterns",
@@ -542,14 +650,11 @@ impl Mode {
 
 #[allow(dead_code)]
 fn is_llm_mode(mode: Mode) -> bool {
-    matches!(
-        mode,
-        Mode::Finite | Mode::Infinite | Mode::Code | Mode::Ngrams
-    )
+    matches!(mode, Mode::Prose | Mode::Words | Mode::Code | Mode::Ngrams)
 }
 
 fn shows_prompt_input(mode: Mode) -> bool {
-    matches!(mode, Mode::Finite | Mode::Infinite | Mode::Code)
+    matches!(mode, Mode::Prose | Mode::Words | Mode::Code)
 }
 
 struct TypingSession {
@@ -573,11 +678,20 @@ struct TypingSession {
     /// For code mode re-highlighting.
     code_lang_idx: Option<usize>,
     prompt: String,
+    /// Flash mode: when the current symbol was shown.
+    char_shown_at: Option<Instant>,
+    /// Flash mode: per-correct-press reaction times in ms.
+    reaction_times_ms: Vec<f64>,
 }
 
 impl TypingSession {
     fn new_local(text: String, mode: Mode, prompt: String) -> Self {
-        let target = text.chars().collect();
+        let target: Vec<char> = text.chars().collect();
+        let char_shown_at = if mode == Mode::Flash && !target.is_empty() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         Self {
             target,
             typed: Vec::new(),
@@ -594,6 +708,8 @@ impl TypingSession {
             gen_user: String::new(),
             code_lang_idx: None,
             prompt,
+            char_shown_at,
+            reaction_times_ms: Vec::new(),
         }
     }
 
@@ -621,6 +737,8 @@ impl TypingSession {
             gen_user,
             code_lang_idx,
             prompt,
+            char_shown_at: None,
+            reaction_times_ms: Vec::new(),
         }
     }
 
@@ -665,14 +783,16 @@ impl TypingSession {
 
     fn needs_refill(&self) -> bool {
         const AHEAD: usize = 150;
-        self.mode == Mode::Infinite
+        // Prose mode with no word limit streams indefinitely and refills when the buffer runs low.
+        self.mode == Mode::Prose
+            && self.word_limit.is_none()
             && self.stream_done
             && !self.streaming
             && self.target.len().saturating_sub(self.typed.len()) < AHEAD
     }
 
     fn is_complete(&self) -> bool {
-        if self.mode == Mode::Infinite {
+        if self.mode == Mode::Prose && self.word_limit.is_none() {
             return false;
         }
         !self.target.is_empty() && self.typed.len() >= self.target.len() && self.stream_done
@@ -714,11 +834,11 @@ impl TypingSession {
         if self.is_complete() {
             return;
         }
-        if self.start_time.is_none() {
-            self.start_time = Some(Instant::now());
-        }
         let expected = self.target.get(self.typed.len()).copied();
         if let Some(exp) = expected {
+            if self.start_time.is_none() {
+                self.start_time = Some(Instant::now());
+            }
             if c != exp {
                 self.error_count += 1;
             }
@@ -727,6 +847,13 @@ impl TypingSession {
                 self.finish_time = Some(Instant::now());
             }
         }
+    }
+
+    fn avg_reaction_ms(&self) -> Option<f64> {
+        if self.reaction_times_ms.is_empty() {
+            return None;
+        }
+        Some(self.reaction_times_ms.iter().sum::<f64>() / self.reaction_times_ms.len() as f64)
     }
 
     fn backspace(&mut self) {
@@ -753,6 +880,7 @@ impl TypingSession {
             correct: self.correct_count(),
             text_length: self.typed.len(),
             prompt: self.prompt.clone(),
+            avg_reaction_ms: self.avg_reaction_ms(),
         }
     }
 }
@@ -876,6 +1004,8 @@ struct ConfigState {
     code_lang_idx: usize,
     options_idx: usize,
     word_count: usize,
+    /// When true, Prose mode streams indefinitely (no word limit).
+    prose_infinite: bool,
     ngram_kind: usize,
     ngram_count: usize,
     symbol_len: usize,
@@ -884,14 +1014,17 @@ struct ConfigState {
     sample_idx: usize,
     focus: ConfigFocus,
     samples: Vec<String>,
+    /// Saved prompt text per mode, to restore when switching back.
+    prose_prompt: String,
+    words_prompt: String,
+    code_prompt: String,
 }
 
 impl ConfigState {
     fn option_count(&self) -> usize {
         match self.mode {
-            Mode::Finite => 2,
-            Mode::Infinite => 1,
-            Mode::Flash => 0, // no options - charset removed
+            Mode::Prose | Mode::Words => 2,
+            Mode::Flash => 0,
             Mode::Symbols => 1,
             Mode::Ngrams => 2,
             Mode::Code => 1,
@@ -900,11 +1033,21 @@ impl ConfigState {
 
     fn option_items(&self) -> Vec<(&'static str, String)> {
         match self.mode {
-            Mode::Finite => vec![
+            Mode::Prose => vec![
+                ("Language", LANGUAGES[self.lang_idx].name.to_string()),
+                (
+                    "Words",
+                    if self.prose_infinite {
+                        "∞".into()
+                    } else {
+                        self.word_count.to_string()
+                    },
+                ),
+            ],
+            Mode::Words => vec![
                 ("Language", LANGUAGES[self.lang_idx].name.to_string()),
                 ("Words", self.word_count.to_string()),
             ],
-            Mode::Infinite => vec![("Language", LANGUAGES[self.lang_idx].name.to_string())],
             Mode::Flash => vec![],
             Mode::Symbols => vec![("Length", self.symbol_len.to_string())],
             Mode::Ngrams => vec![
@@ -917,11 +1060,21 @@ impl ConfigState {
 
     fn adjust_option(&mut self, delta: i32) {
         match (self.mode, self.options_idx) {
-            (Mode::Finite, 0) | (Mode::Infinite, 0) => {
+            (Mode::Prose, 0) | (Mode::Words, 0) => {
                 let n = LANGUAGES.len() as i32;
                 self.lang_idx = ((self.lang_idx as i32 + delta).rem_euclid(n)) as usize;
             }
-            (Mode::Finite, 1) => {
+            (Mode::Prose, 1) => {
+                if self.prose_infinite && delta > 0 {
+                    self.prose_infinite = false;
+                    self.word_count = 10;
+                } else if !self.prose_infinite && self.word_count <= 10 && delta < 0 {
+                    self.prose_infinite = true;
+                } else if !self.prose_infinite {
+                    self.word_count = (self.word_count as i32 + delta * 10).clamp(10, 500) as usize;
+                }
+            }
+            (Mode::Words, 1) => {
                 self.word_count = (self.word_count as i32 + delta * 10).clamp(10, 500) as usize;
             }
             (Mode::Symbols, 0) => {
@@ -1141,10 +1294,36 @@ fn build_system_prompt(app: &App) -> String {
              the code with no explanations, no markdown, no code fences.",
             CODE_LANGS[app.cfg.code_lang_idx].name
         ),
-        Mode::Finite => format!(
-            "{} Generate exactly {} words.",
-            LANGUAGES[app.cfg.lang_idx].system_prompt, app.cfg.word_count
-        ),
+        Mode::Prose => {
+            let mut sys = if app.cfg.prose_infinite {
+                LANGUAGES[app.cfg.lang_idx].system_prompt.to_string()
+            } else {
+                format!(
+                    "{} Generate exactly {} words.",
+                    LANGUAGES[app.cfg.lang_idx].system_prompt, app.cfg.word_count
+                )
+            };
+            sys.push_str(
+                " Avoid repeating words, phrases, or sentence structures. \
+                 Vary your vocabulary. Do not start multiple sentences the same way.",
+            );
+            sys
+        }
+        Mode::Words => {
+            let mut sys = format!(
+                "You are a typing practice text generator. Generate exactly {} common English \
+                 words for typing practice, separated by spaces. Use only lowercase letters. \
+                 No punctuation, no symbols, no numbers. Output only the words.",
+                app.cfg.word_count
+            );
+            if !app.cfg.prompt_buf.trim().is_empty() {
+                sys.push_str(&format!(
+                    " Topic or domain: {}.",
+                    app.cfg.prompt_buf.trim()
+                ));
+            }
+            sys
+        }
         Mode::Ngrams => {
             let kind = NGRAM_KINDS[app.cfg.ngram_kind];
             format!(
@@ -1220,23 +1399,47 @@ fn draw_config(f: &mut Frame, app: &App) {
             .fg(bar_fg)
             .bg(bar_bg)
             .add_modifier(Modifier::BOLD);
+        let mode_name = app.cfg.mode.name();
         let stats_text = if app.recent_stats.is_empty() {
-            " No recent sessions".to_string()
+            format!(" No recent sessions ({mode_name})")
         } else {
             let n = app.recent_stats.len();
-            let avg_wpm = app.recent_stats.iter().map(|s| s.wpm).sum::<f64>() / n as f64;
             let avg_acc = app.recent_stats.iter().map(|s| s.accuracy).sum::<f64>() / n as f64;
-            let best_wpm = app
-                .recent_stats
-                .iter()
-                .map(|s| s.wpm)
-                .fold(f64::NEG_INFINITY, f64::max);
-            format!(
-                " Last {n}:  WPM: {:5.1}  |  Accuracy: {:5.1}%  |  Best: {:5.1} ",
-                avg_wpm,
-                avg_acc * 100.0,
-                best_wpm,
-            )
+            if app.cfg.mode == Mode::Flash {
+                let reaction_vals: Vec<f64> = app
+                    .recent_stats
+                    .iter()
+                    .filter_map(|s| s.avg_reaction_ms)
+                    .collect();
+                if reaction_vals.is_empty() {
+                    format!(
+                        " Last {n} ({mode_name}):  Accuracy: {:5.1}%  |  Avg Reaction: - ",
+                        avg_acc * 100.0,
+                    )
+                } else {
+                    let avg_react = reaction_vals.iter().sum::<f64>() / reaction_vals.len() as f64;
+                    let best_react = reaction_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+                    format!(
+                        " Last {n} ({mode_name}):  Accuracy: {:5.1}%  |  Avg Reaction: {:.0}ms  |  Best: {:.0}ms ",
+                        avg_acc * 100.0,
+                        avg_react,
+                        best_react,
+                    )
+                }
+            } else {
+                let avg_wpm = app.recent_stats.iter().map(|s| s.wpm).sum::<f64>() / n as f64;
+                let best_wpm = app
+                    .recent_stats
+                    .iter()
+                    .map(|s| s.wpm)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                format!(
+                    " Last {n} ({mode_name}):  WPM: {:5.1}  |  Accuracy: {:5.1}%  |  Best: {:5.1} ",
+                    avg_wpm,
+                    avg_acc * 100.0,
+                    best_wpm,
+                )
+            }
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(stats_text, bar_style)))
@@ -1540,12 +1743,16 @@ fn draw_flash_typing(f: &mut Frame, session: &TypingSession, bar_style: Style, a
         None => Color::White,
     };
 
+    let reaction_str = match session.avg_reaction_ms() {
+        Some(ms) => format!("{:.0}ms", ms),
+        None => "-".into(),
+    };
     let status = format!(
-        " Progress: {pos}/{total}  |  Correct: {}  |  Errors: {}  |  Accuracy: {:.1}%  |  WPM: {:.1} ",
+        " Progress: {pos}/{total}  |  Correct: {}  |  Errors: {}  |  Accuracy: {:.1}%  |  Avg: {} ",
         session.correct_count(),
         session.error_count,
         session.accuracy() * 100.0,
-        session.wpm(),
+        reaction_str,
     );
 
     let chunks = Layout::default()
@@ -1566,28 +1773,24 @@ fn draw_flash_typing(f: &mut Frame, session: &TypingSession, bar_style: Style, a
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(35),
-            Constraint::Length(3),
-            Constraint::Percentage(35),
+            Constraint::Percentage(30),
+            Constraint::Length(11),
+            Constraint::Percentage(30),
             Constraint::Min(0),
         ])
         .split(chunks[1]);
 
     if pos < total {
         let ch = session.target[pos];
-        let style = if session.last_was_error {
+        let on_style = if session.last_was_error {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(ch.to_string(), style)))
-                .block(Block::default().borders(Borders::ALL))
-                .alignment(Alignment::Center),
-            inner[1],
-        );
+        let lines = render_glyph(ch, on_style);
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner[1]);
     }
 
     f.render_widget(
@@ -1728,17 +1931,67 @@ fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
                 app.base_url.clone(),
             );
         }
-        mode => {
-            let word_limit = (mode == Mode::Finite).then_some(app.cfg.word_count);
-            let code_lang_idx = (mode == Mode::Code).then_some(app.cfg.code_lang_idx);
+        Mode::Prose => {
+            let word_limit = (!app.cfg.prose_infinite).then_some(app.cfg.word_count);
             let sys = build_system_prompt(app);
             let user = app.cfg.prompt_buf.trim().to_string();
             let session = TypingSession::new_streaming(
-                mode,
+                Mode::Prose,
                 word_limit,
                 sys.clone(),
                 user.clone(),
-                code_lang_idx,
+                None,
+                user.clone(),
+            );
+            app.typing = Some(session);
+            app.screen = Screen::Typing;
+            spawn_llm_stream(
+                tx.clone(),
+                sys,
+                user,
+                app.provider.clone(),
+                app.model.clone(),
+                app.api_key.clone(),
+                app.base_url.clone(),
+            );
+        }
+        Mode::Words => {
+            let sys = build_system_prompt(app);
+            let prompt_text = app.cfg.prompt_buf.trim().to_string();
+            let user = if prompt_text.is_empty() {
+                format!("Generate {} words.", app.cfg.word_count)
+            } else {
+                prompt_text.clone()
+            };
+            let session = TypingSession::new_streaming(
+                Mode::Words,
+                Some(app.cfg.word_count),
+                sys.clone(),
+                user.clone(),
+                None,
+                prompt_text,
+            );
+            app.typing = Some(session);
+            app.screen = Screen::Typing;
+            spawn_llm_stream(
+                tx.clone(),
+                sys,
+                user,
+                app.provider.clone(),
+                app.model.clone(),
+                app.api_key.clone(),
+                app.base_url.clone(),
+            );
+        }
+        Mode::Code => {
+            let sys = build_system_prompt(app);
+            let user = app.cfg.prompt_buf.trim().to_string();
+            let session = TypingSession::new_streaming(
+                Mode::Code,
+                None,
+                sys.clone(),
+                user.clone(),
+                Some(app.cfg.code_lang_idx),
                 user.clone(),
             );
             app.typing = Some(session);
@@ -1769,6 +2022,7 @@ async fn main() -> Result<()> {
             .join("config.toml")
     });
     let config = load_config(&config_path);
+    let mut persisted_config = config.clone(); // kept for mode_cache save on exit
 
     let provider = cli
         .provider
@@ -1805,17 +2059,22 @@ async fn main() -> Result<()> {
         .unwrap_or(accent_color);
 
     if let Some(Commands::ClearStats) = cli.command {
-        if stats_file.exists() {
-            std::fs::remove_file(&stats_file)?;
-            println!("Stats cleared: {}", stats_file.display());
-        } else {
-            println!("No stats file found at {}", stats_file.display());
+        let mut cleared = 0;
+        for &mode in Mode::ALL {
+            let path = stats_path(&stats_file, mode);
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                println!("Cleared: {}", path.display());
+                cleared += 1;
+            }
+        }
+        if cleared == 0 {
+            println!("No stats files found.");
         }
         return Ok(());
     }
 
     let stats_window = cli.stats_window.or(config.train.stats_window).unwrap_or(10);
-    let recent_stats = load_recent_stats(&stats_file, stats_window);
 
     let mut samples: Vec<String> = config.train.prompts;
     samples.extend(cli.extra_prompts);
@@ -1829,25 +2088,50 @@ async fn main() -> Result<()> {
         ];
     }
 
-    let prompt_buf = samples.first().cloned().unwrap_or_default();
+    // Restore cached settings
+    let cache = &persisted_config.train.mode_cache;
+    let initial_mode = cache
+        .last_mode
+        .as_deref()
+        .and_then(|n| Mode::ALL.iter().find(|&&m| m.name() == n).copied())
+        .unwrap_or(Mode::Prose);
+    let prose_prompt = cache.prose_prompt.clone().unwrap_or_default();
+    let words_prompt = cache.words_prompt.clone().unwrap_or_default();
+    let code_prompt  = cache.code_prompt.clone().unwrap_or_default();
+    let initial_prompt = match initial_mode {
+        Mode::Prose => prose_prompt.clone(),
+        Mode::Words => words_prompt.clone(),
+        Mode::Code  => code_prompt.clone(),
+        _ => String::new(),
+    };
+    let prompt_buf = if initial_prompt.is_empty() {
+        samples.first().cloned().unwrap_or_default()
+    } else {
+        initial_prompt
+    };
     let prompt_cursor = prompt_buf.chars().count();
+    let recent_stats = load_recent_stats(&stats_path(&stats_file, initial_mode), stats_window);
 
     let mut app = App {
         screen: Screen::Config,
         cfg: ConfigState {
-            mode: Mode::Finite,
-            lang_idx: 0,
-            code_lang_idx: 0,
+            mode: initial_mode,
+            lang_idx: cache.lang.unwrap_or(0),
+            code_lang_idx: cache.code_lang.unwrap_or(0),
             options_idx: 0,
-            word_count: 50,
-            ngram_kind: 2,
-            ngram_count: 50,
-            symbol_len: 80,
+            word_count: cache.word_count.unwrap_or(50),
+            prose_infinite: cache.prose_infinite.unwrap_or(true),
+            ngram_kind: cache.ngram_kind.unwrap_or(2),
+            ngram_count: cache.ngram_count.unwrap_or(50),
+            symbol_len: cache.symbol_length.unwrap_or(80),
             prompt_buf,
             prompt_cursor,
             sample_idx: 0,
             focus: ConfigFocus::ModeList,
             samples,
+            prose_prompt,
+            words_prompt,
+            code_prompt,
         },
         typing: None,
         status_msg: String::new(),
@@ -1983,15 +2267,49 @@ async fn main() -> Result<()> {
                                         KeyCode::Up => {
                                             let idx = cfg.mode.index();
                                             if idx > 0 {
+                                                // Save current prompt
+                                                match cfg.mode {
+                                                    Mode::Prose => cfg.prose_prompt = cfg.prompt_buf.clone(),
+                                                    Mode::Words => cfg.words_prompt = cfg.prompt_buf.clone(),
+                                                    Mode::Code  => cfg.code_prompt  = cfg.prompt_buf.clone(),
+                                                    _ => {}
+                                                }
                                                 cfg.mode = Mode::ALL[idx - 1];
                                                 cfg.options_idx = 0;
+                                                // Restore prompt for new mode
+                                                cfg.prompt_buf = match cfg.mode {
+                                                    Mode::Prose => cfg.prose_prompt.clone(),
+                                                    Mode::Words => cfg.words_prompt.clone(),
+                                                    Mode::Code  => cfg.code_prompt.clone(),
+                                                    _ => String::new(),
+                                                };
+                                                cfg.prompt_cursor = cfg.prompt_buf.chars().count();
+                                                let mode = cfg.mode;
+                                                app.recent_stats = load_recent_stats(&stats_path(&app.stats_file, mode), app.stats_window);
                                             }
                                         }
                                         KeyCode::Down => {
                                             let idx = cfg.mode.index();
                                             if idx + 1 < Mode::ALL.len() {
+                                                // Save current prompt
+                                                match cfg.mode {
+                                                    Mode::Prose => cfg.prose_prompt = cfg.prompt_buf.clone(),
+                                                    Mode::Words => cfg.words_prompt = cfg.prompt_buf.clone(),
+                                                    Mode::Code  => cfg.code_prompt  = cfg.prompt_buf.clone(),
+                                                    _ => {}
+                                                }
                                                 cfg.mode = Mode::ALL[idx + 1];
                                                 cfg.options_idx = 0;
+                                                // Restore prompt for new mode
+                                                cfg.prompt_buf = match cfg.mode {
+                                                    Mode::Prose => cfg.prose_prompt.clone(),
+                                                    Mode::Words => cfg.words_prompt.clone(),
+                                                    Mode::Code  => cfg.code_prompt.clone(),
+                                                    _ => String::new(),
+                                                };
+                                                cfg.prompt_cursor = cfg.prompt_buf.chars().count();
+                                                let mode = cfg.mode;
+                                                app.recent_stats = load_recent_stats(&stats_path(&app.stats_file, mode), app.stats_window);
                                             }
                                         }
                                         _ => {}
@@ -2061,8 +2379,9 @@ async fn main() -> Result<()> {
                                 } else {
                                     if let Some(ref mut s) = app.typing {
                                         s.force_done();
+                                        let mode = s.mode;
                                         let stats = s.to_stats();
-                                        match save_stats(&app.stats_file, &stats) {
+                                        match save_stats(&stats_path(&app.stats_file, mode), &stats) {
                                             Ok(()) => app.stats_save_error = None,
                                             Err(e) => {
                                                 app.stats_save_error = Some(e.to_string())
@@ -2088,13 +2407,17 @@ async fn main() -> Result<()> {
                                             let pos = s.typed.len();
                                             if pos < s.target.len() {
                                                 if c == s.target[pos] {
+                                                    if let Some(t) = s.char_shown_at {
+                                                        s.reaction_times_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                                                    }
                                                     s.last_was_error = false;
                                                     s.type_char(c);
+                                                    s.char_shown_at = Some(Instant::now());
                                                     complete = s.is_complete();
                                                 } else {
                                                     s.error_count += 1;
                                                     s.last_was_error = true;
-                                                    if s.start_time.is_none() {
+                                                    if s.start_time.is_none() && !s.target.is_empty() {
                                                         s.start_time = Some(Instant::now());
                                                     }
                                                 }
@@ -2107,8 +2430,9 @@ async fn main() -> Result<()> {
                                 }
                                 update_kbd_led(&app);
                                 if complete {
+                                    let mode = app.typing.as_ref().unwrap().mode;
                                     let stats = app.typing.as_ref().unwrap().to_stats();
-                                    match save_stats(&app.stats_file, &stats) {
+                                    match save_stats(&stats_path(&app.stats_file, mode), &stats) {
                                         Ok(()) => app.stats_save_error = None,
                                         Err(e) => app.stats_save_error = Some(e.to_string()),
                                     }
@@ -2121,7 +2445,8 @@ async fn main() -> Result<()> {
                         Screen::Done => match key.code {
                             KeyCode::Char('q') => break,
                             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('r') => {
-                                app.recent_stats = load_recent_stats(&app.stats_file, app.stats_window);
+                                let mode = app.cfg.mode;
+                                app.recent_stats = load_recent_stats(&stats_path(&app.stats_file, mode), app.stats_window);
                                 app.typing = None;
                                 app.stats_save_error = None;
                                 app.screen = Screen::Config;
@@ -2143,6 +2468,32 @@ async fn main() -> Result<()> {
     // Return keyboard LEDs to firmware control.
     if let Some(ref kb_tx) = app.kb_tx {
         let _ = kb_tx.send(KbCmd::ClearAll);
+    }
+
+    // Save mode cache to config file.
+    {
+        let cfg = &app.cfg;
+        // Make sure the current mode's prompt is saved.
+        let (prose_p, words_p, code_p) = match cfg.mode {
+            Mode::Prose => (cfg.prompt_buf.clone(), cfg.words_prompt.clone(), cfg.code_prompt.clone()),
+            Mode::Words => (cfg.prose_prompt.clone(), cfg.prompt_buf.clone(), cfg.code_prompt.clone()),
+            Mode::Code  => (cfg.prose_prompt.clone(), cfg.words_prompt.clone(), cfg.prompt_buf.clone()),
+            _ => (cfg.prose_prompt.clone(), cfg.words_prompt.clone(), cfg.code_prompt.clone()),
+        };
+        persisted_config.train.mode_cache = ModeCache {
+            last_mode: Some(cfg.mode.name().to_string()),
+            lang: Some(cfg.lang_idx),
+            word_count: Some(cfg.word_count),
+            prose_infinite: Some(cfg.prose_infinite),
+            prose_prompt: Some(prose_p),
+            words_prompt: Some(words_p),
+            symbol_length: Some(cfg.symbol_len),
+            ngram_kind: Some(cfg.ngram_kind),
+            ngram_count: Some(cfg.ngram_count),
+            code_lang: Some(cfg.code_lang_idx),
+            code_prompt: Some(code_p),
+        };
+        let _ = save_config(&config_path, &persisted_config);
     }
 
     result
