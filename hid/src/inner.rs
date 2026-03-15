@@ -277,7 +277,7 @@ impl OryxKeyboard {
 
     /// Move to `layer` (equivalent to `layer_move()` in QMK).
     #[bisync]
-    pub async fn set_layer(&mut self, layer: u8) -> Result<()> {
+    pub async fn layer(&mut self, layer: u8) -> Result<()> {
         self.send(&[protocol::Command::SetLayer as u8, 1, layer])
             .await
     }
@@ -306,7 +306,7 @@ impl OryxKeyboard {
 
     /// Set the colour of a single RGB LED by its matrix index.
     #[bisync]
-    pub async fn set_rgb(&mut self, index: u8, r: u8, g: u8, b: u8) -> Result<()> {
+    pub async fn rgb(&mut self, index: u8, r: u8, g: u8, b: u8) -> Result<()> {
         self.send(&[protocol::Command::SetRgbLed as u8, index, r, g, b])
             .await
     }
@@ -320,14 +320,14 @@ impl OryxKeyboard {
 
     /// Increase (`true`) or decrease (`false`) the RGB matrix brightness.
     #[bisync]
-    pub async fn update_brightness(&mut self, increase: bool) -> Result<()> {
+    pub async fn brightness(&mut self, increase: bool) -> Result<()> {
         self.send(&[protocol::Command::UpdateBrightness as u8, increase as u8])
             .await
     }
 
     /// Turn an individual status LED on or off. `led` is 0-indexed (0–5).
     #[bisync]
-    pub async fn set_status_led(&mut self, led: u8, on: bool) -> Result<()> {
+    pub async fn led(&mut self, led: u8, on: bool) -> Result<()> {
         self.send(&[protocol::Command::SetStatusLed as u8, led, on as u8])
             .await
     }
@@ -335,7 +335,7 @@ impl OryxKeyboard {
     /// Enable or disable firmware control of all status LEDs.
     /// Returns the new state confirmed by the firmware.
     #[bisync]
-    pub async fn set_status_led_control(&mut self, enable: bool) -> Result<bool> {
+    pub async fn led_control(&mut self, enable: bool) -> Result<bool> {
         self.send(&[protocol::Command::StatusLedControl as u8, enable as u8])
             .await?;
         match self.recv_event().await? {

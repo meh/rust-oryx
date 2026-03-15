@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf; // used by layout_cache_path
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::{
@@ -19,6 +20,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs},
 };
 use tokio::sync::mpsc;
+use tokio::time;
+
+const INDEX_HOLD_THRESHOLD: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(about = "Visualize your ZSA keyboard layout")]
@@ -351,15 +355,18 @@ fn content_line(
     base_keys: Option<&[layout::Key]>,
     indices: &[usize],
     pressed: &HashSet<usize>,
+    long_held: &HashSet<usize>,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw("│")];
     for &i in indices {
-        let k = &all_keys[i];
-        let bk = base_keys.and_then(|bks| bks.get(i));
-        spans.push(Span::styled(
-            key_label(k, bk),
-            key_style(k, bk, pressed.contains(&i)),
-        ));
+        let (label, style) = if long_held.contains(&i) {
+            (format!("{:^4}", i), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        } else {
+            let k = &all_keys[i];
+            let bk = base_keys.and_then(|bks| bks.get(i));
+            (key_label(k, bk), key_style(k, bk, pressed.contains(&i)))
+        };
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw("│"));
     }
     spans
@@ -369,6 +376,7 @@ fn render_keyboard(
     keys: &[layout::Key],
     base_keys: Option<&[layout::Key]>,
     pressed: &HashSet<usize>,
+    long_held: &HashSet<usize>,
 ) -> Vec<Line<'static>> {
     if keys.len() < 72 {
         return vec![Line::from("Not enough keys in layout")];
@@ -400,9 +408,21 @@ fn render_keyboard(
         let rb = if row == 0 { row_top(7) } else { row_mid(7) };
         lines.push(Line::from(format!("{}{}{}", lb, MAIN_GAP, rb)));
         let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.extend(content_line(keys, base_keys, left_main[row], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            left_main[row],
+            pressed,
+            long_held,
+        ));
         spans.push(Span::raw(MAIN_GAP));
-        spans.extend(content_line(keys, base_keys, right_main[row], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            right_main[row],
+            pressed,
+            long_held,
+        ));
         lines.push(Line::from(spans));
     }
     // Transition: 3×7 bottom / 1×6 top merged
@@ -420,6 +440,7 @@ fn render_keyboard(
             base_keys,
             &[21, 22, 23, 24, 25, 26],
             pressed,
+            long_held,
         ));
         spans.push(Span::raw(ROW3_GAP));
         spans.extend(content_line(
@@ -427,6 +448,7 @@ fn render_keyboard(
             base_keys,
             &[57, 58, 59, 60, 61, 62],
             pressed,
+            long_held,
         ));
         lines.push(Line::from(spans));
     }
@@ -445,6 +467,7 @@ fn render_keyboard(
             base_keys,
             &[27, 28, 29, 30, 31],
             pressed,
+            long_held,
         ));
         spans.push(Span::raw(ROW4_GAP));
         spans.extend(content_line(
@@ -452,6 +475,7 @@ fn render_keyboard(
             base_keys,
             &[63, 64, 65, 66, 67],
             pressed,
+            long_held,
         ));
         lines.push(Line::from(spans));
     }
@@ -491,16 +515,30 @@ fn render_keyboard(
         let wr = 68usize;
         let wl_bk = base_keys.and_then(|bks| bks.get(wl));
         let wr_bk = base_keys.and_then(|bks| bks.get(wr));
-        let l_label = format!("{:^9}", key_label(&keys[wl], wl_bk).trim());
-        let r_label = format!("{:^9}", key_label(&keys[wr], wr_bk).trim());
+        let (l_label, l_style) = if long_held.contains(&wl) {
+            (format!("{:^9}", wl), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        } else {
+            (
+                format!("{:^9}", key_label(&keys[wl], wl_bk).trim()),
+                key_style(&keys[wl], wl_bk, pressed.contains(&wl)),
+            )
+        };
+        let (r_label, r_style) = if long_held.contains(&wr) {
+            (format!("{:^9}", wr), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        } else {
+            (
+                format!("{:^9}", key_label(&keys[wr], wr_bk).trim()),
+                key_style(&keys[wr], wr_bk, pressed.contains(&wr)),
+            )
+        };
         lines.push(Line::from(vec![
             Span::raw(THM_L_PAD),
             Span::raw("     │"),
-            Span::styled(l_label, key_style(&keys[wl], wl_bk, pressed.contains(&wl))),
+            Span::styled(l_label, l_style),
             Span::raw("│"),
             Span::raw(THM_M_GAP),
             Span::raw("│"),
-            Span::styled(r_label, key_style(&keys[wr], wr_bk, pressed.contains(&wr))),
+            Span::styled(r_label, r_style),
             Span::raw("│     "),
         ]));
     }
@@ -513,9 +551,21 @@ fn render_keyboard(
     {
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::raw(THM_L_PAD));
-        spans.extend(content_line(keys, base_keys, &[33, 34, 35], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[33, 34, 35],
+            pressed,
+            long_held,
+        ));
         spans.push(Span::raw(THM_M_GAP));
-        spans.extend(content_line(keys, base_keys, &[69, 70, 71], pressed));
+        spans.extend(content_line(
+            keys,
+            base_keys,
+            &[69, 70, 71],
+            pressed,
+            long_held,
+        ));
         lines.push(Line::from(spans));
     }
     // bottom of small keys
@@ -544,6 +594,7 @@ struct App {
     view_layer: usize,
     active_layer: usize,
     pressed: HashSet<usize>,
+    press_times: HashMap<usize, Instant>,
     status: String,
     keyboard_connected: bool,
 }
@@ -555,6 +606,7 @@ impl App {
             view_layer: 0,
             active_layer: 0,
             pressed: HashSet::new(),
+            press_times: HashMap::new(),
             status: "Connecting to keyboard…".into(),
             keyboard_connected: false,
         }
@@ -576,9 +628,11 @@ impl App {
             }
             Msg::KeyDown(i) => {
                 self.pressed.insert(i);
+                self.press_times.insert(i, Instant::now());
             }
             Msg::KeyUp(i) => {
                 self.pressed.remove(&i);
+                self.press_times.remove(&i);
             }
             Msg::LayoutLoaded(r) => {
                 self.layout_data = Some(*r);
@@ -591,6 +645,7 @@ impl App {
             Msg::KbDisconnected => {
                 self.keyboard_connected = false;
                 self.pressed.clear();
+                self.press_times.clear();
                 self.status = "Disconnected".into();
             }
             Msg::StatusUpdate(s) => {
@@ -611,6 +666,13 @@ fn draw(f: &mut Frame, app: &App, accent_color: Color) {
         .fg(Color::White)
         .bg(accent_color)
         .add_modifier(Modifier::BOLD);
+
+    let long_held: HashSet<usize> = app
+        .press_times
+        .iter()
+        .filter(|(_, t)| t.elapsed() >= INDEX_HOLD_THRESHOLD)
+        .map(|(&i, _)| i)
+        .collect();
 
     if let Some(ref response) = app.layout_data {
         if let Some(ref rev) = response.data.layout.revision {
@@ -657,6 +719,7 @@ fn draw(f: &mut Frame, app: &App, accent_color: Color) {
                     &rev.layers[app.view_layer].keys,
                     base_keys,
                     &app.pressed,
+                    &long_held,
                 )),
                 chunks[1],
             );
@@ -793,11 +856,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = App::new();
     let mut events = EventStream::new();
+    let mut tick = time::interval(Duration::from_millis(100));
 
     let result = async {
         loop {
             terminal.draw(|f| draw(f, &app, accent_color))?;
             tokio::select! {
+                _ = tick.tick() => {}
                 Some(msg) = rx.recv() => {
                     app.apply(msg);
                 }
