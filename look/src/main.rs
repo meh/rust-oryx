@@ -286,7 +286,7 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     if effective.tap_hold.is_some() {
         style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     }
-    match effective.glow_color.as_deref().and_then(parse_hex_color) {
+    match key.glow_color.as_deref().and_then(parse_hex_color) {
         Some(bg) => style.bg(bg),
         None => style,
     }
@@ -684,7 +684,7 @@ fn draw(f: &mut Frame, app: &App, accent_color: Color) {
                     let name = l.title.as_deref().unwrap_or("?");
                     if i == app.active_layer {
                         Line::from(Span::styled(
-                            format!(" {} ", name),
+                            format!("  {}  ", name),
                             Style::default()
                                 .fg(accent_color)
                                 .add_modifier(Modifier::BOLD),
