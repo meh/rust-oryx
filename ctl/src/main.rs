@@ -136,13 +136,16 @@ fn main() -> Result<()> {
             println!("RGB control: {}", if new { "on" } else { "off" });
         }
 
-        Cmd::Rgb(RgbCmd::Set { index, color: (r, g, b) }) => {
+        Cmd::Rgb(RgbCmd::Set {
+            index,
+            color: (r, g, b),
+        }) => {
             kb.rgb(index, r, g, b)?;
             println!("LED {index} set to #{r:02x}{g:02x}{b:02x}");
         }
 
         Cmd::Rgb(RgbCmd::All { color: (r, g, b) }) => {
-            kb.set_rgb_all(r, g, b)?;
+            kb.rgb_all(r, g, b)?;
             println!("all LEDs set to #{r:02x}{g:02x}{b:02x}");
         }
 
@@ -166,7 +169,10 @@ fn main() -> Result<()> {
                 bail!("status LED index must be 0–5, got {index}");
             }
             kb.led(index, state.as_bool())?;
-            println!("status LED {index}: {}", if state.as_bool() { "on" } else { "off" });
+            println!(
+                "status LED {index}: {}",
+                if state.as_bool() { "on" } else { "off" }
+            );
         }
     }
 

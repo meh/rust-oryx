@@ -313,7 +313,7 @@ impl OryxKeyboard {
 
     /// Set all RGB LEDs to the same colour in one packet.
     #[bisync]
-    pub async fn set_rgb_all(&mut self, r: u8, g: u8, b: u8) -> Result<()> {
+    pub async fn rgb_all(&mut self, r: u8, g: u8, b: u8) -> Result<()> {
         self.send(&[protocol::Command::SetRgbLedAll as u8, r, g, b])
             .await
     }
