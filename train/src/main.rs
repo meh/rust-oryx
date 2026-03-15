@@ -250,6 +250,9 @@ struct SessionStats {
     prompt: String,
     #[serde(default)]
     avg_reaction_ms: Option<f64>,
+    /// Flash mode: average reaction time in ms per symbol key.
+    #[serde(default)]
+    reaction_by_symbol: Option<HashMap<String, f64>>,
 }
 
 // ── Per-mode stats path ───────────────────────────────────────────────────────
@@ -471,10 +474,27 @@ fn generate_symbols(len: usize) -> String {
 }
 
 fn generate_flash_sequence(flash_chars: &[char], len: usize) -> String {
+    if flash_chars.is_empty() {
+        return String::new();
+    }
     let mut rng = rand::rng();
-    (0..len)
-        .map(|_| flash_chars[rng.random_range(0..flash_chars.len())])
-        .collect()
+    let mut result = Vec::with_capacity(len);
+    let mut last = '\0';
+    for _ in 0..len {
+        let ch = if flash_chars.len() == 1 {
+            flash_chars[0]
+        } else {
+            loop {
+                let c = flash_chars[rng.random_range(0..flash_chars.len())];
+                if c != last {
+                    break c;
+                }
+            }
+        };
+        last = ch;
+        result.push(ch);
+    }
+    result.into_iter().collect()
 }
 
 // ── Keymap (keyboard layout) ──────────────────────────────────────────────────
@@ -509,16 +529,17 @@ impl Keymap {
         None
     }
 
-    /// All printable chars on `layer` (or layer 0 fallback).
-    fn printable_chars(&self, layer: u8) -> Vec<char> {
-        let map = self
-            .layers
-            .get(layer as usize)
-            .or_else(|| self.layers.get(0));
-        match map {
-            Some(m) => m.keys().copied().filter(|c| !c.is_control()).collect(),
-            None => Vec::new(),
+    /// All printable chars across every layer (union, deduped).
+    fn all_printable_chars(&self) -> Vec<char> {
+        let mut seen = HashMap::new();
+        for layer in &self.layers {
+            for &ch in layer.keys() {
+                if !ch.is_control() {
+                    seen.insert(ch, ());
+                }
+            }
         }
+        seen.into_keys().collect()
     }
 }
 
@@ -680,8 +701,10 @@ struct TypingSession {
     prompt: String,
     /// Flash mode: when the current symbol was shown.
     char_shown_at: Option<Instant>,
-    /// Flash mode: per-correct-press reaction times in ms.
+    /// Flash mode: per-correct-press reaction times in ms (overall).
     reaction_times_ms: Vec<f64>,
+    /// Flash mode: reaction times per symbol.
+    reaction_by_symbol: HashMap<char, Vec<f64>>,
 }
 
 impl TypingSession {
@@ -710,6 +733,7 @@ impl TypingSession {
             prompt,
             char_shown_at,
             reaction_times_ms: Vec::new(),
+            reaction_by_symbol: HashMap::new(),
         }
     }
 
@@ -739,6 +763,7 @@ impl TypingSession {
             prompt,
             char_shown_at: None,
             reaction_times_ms: Vec::new(),
+            reaction_by_symbol: HashMap::new(),
         }
     }
 
@@ -881,6 +906,19 @@ impl TypingSession {
             text_length: self.typed.len(),
             prompt: self.prompt.clone(),
             avg_reaction_ms: self.avg_reaction_ms(),
+            reaction_by_symbol: if self.reaction_by_symbol.is_empty() {
+                None
+            } else {
+                Some(
+                    self.reaction_by_symbol
+                        .iter()
+                        .map(|(&ch, times)| {
+                            let avg = times.iter().sum::<f64>() / times.len() as f64;
+                            (ch.to_string(), avg)
+                        })
+                        .collect(),
+                )
+            },
         }
     }
 }
@@ -1827,14 +1865,29 @@ fn draw_done(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(format!(
-            "Mode: {}   WPM: {:.1}   Accuracy: {:.1}%   Errors: {}   Time: {}",
-            mode_name,
-            session.wpm(),
-            session.accuracy() * 100.0,
-            session.error_count,
-            fmt_duration(session.elapsed()),
-        )),
+        if session.mode == Mode::Flash {
+            let reaction_str = match session.avg_reaction_ms() {
+                Some(ms) => format!("{:.0}ms", ms),
+                None => "-".into(),
+            };
+            Line::from(format!(
+                "Mode: {}   Avg Reaction: {}   Accuracy: {:.1}%   Errors: {}   Time: {}",
+                mode_name,
+                reaction_str,
+                session.accuracy() * 100.0,
+                session.error_count,
+                fmt_duration(session.elapsed()),
+            ))
+        } else {
+            Line::from(format!(
+                "Mode: {}   WPM: {:.1}   Accuracy: {:.1}%   Errors: {}   Time: {}",
+                mode_name,
+                session.wpm(),
+                session.accuracy() * 100.0,
+                session.error_count,
+                fmt_duration(session.elapsed()),
+            ))
+        },
         Line::from(""),
     ];
 
@@ -1879,15 +1932,11 @@ fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
             let flash_chars: Vec<char> = app
                 .keymap
                 .as_ref()
-                .map(|km| {
-                    let mut chars = km.printable_chars(app.current_layer);
-                    chars.retain(|c| c.is_alphabetic());
-                    chars
-                })
+                .map(|km| km.all_printable_chars())
                 .filter(|chars| !chars.is_empty())
                 .unwrap_or_default();
             if flash_chars.is_empty() {
-                app.status_msg = "No alphabetic keys found in keyboard layout.".into();
+                app.status_msg = "No printable keys found in keyboard layout.".into();
                 return;
             }
             let text = generate_flash_sequence(&flash_chars, 100);
@@ -2408,7 +2457,9 @@ async fn main() -> Result<()> {
                                             if pos < s.target.len() {
                                                 if c == s.target[pos] {
                                                     if let Some(t) = s.char_shown_at {
-                                                        s.reaction_times_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                                                        let ms = t.elapsed().as_secs_f64() * 1000.0;
+                                                        s.reaction_times_ms.push(ms);
+                                                        s.reaction_by_symbol.entry(c).or_default().push(ms);
                                                     }
                                                     s.last_was_error = false;
                                                     s.type_char(c);
