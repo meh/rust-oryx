@@ -1,0 +1,20 @@
+[package]
+name = "oryx-train"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "5"
+futures-lite = "2"
+llm = { version = "1", default-features = false, features = [
+    "openai", "anthropic", "ollama", "groq", "deepseek",
+    "google", "mistral", "rustls-tls",
+] }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
