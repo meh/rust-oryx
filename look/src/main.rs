@@ -19,8 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
 };
-use tokio::sync::mpsc;
-use tokio::time;
+use tokio::{sync::mpsc, time};
 
 const INDEX_HOLD_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -360,7 +359,12 @@ fn content_line(
     let mut spans = vec![Span::raw("│")];
     for &i in indices {
         let (label, style) = if long_held.contains(&i) {
-            (format!("{:^4}", i), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+            (
+                format!("{:^4}", i),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             let k = &all_keys[i];
             let bk = base_keys.and_then(|bks| bks.get(i));
@@ -371,6 +375,21 @@ fn content_line(
     }
     spans
 }
+
+// ┌────┬────┬────┬────┬────┬────┬────┐     ┌────┬────┬────┬────┬────┬────┬────┐
+// │    │    │    │    │    │    │    │     │    │    │    │    │    │    │    │
+// ├────┼────┼────┼────┼────┼────┼────┤     ├────┼────┼────┼────┼────┼────┼────┤
+// │    │    │    │    │    │    │    │     │    │    │    │    │    │    │    │
+// ├────┼────┼────┼────┼────┼────┼────┤     ├────┼────┼────┼────┼────┼────┼────┤
+// │    │    │    │    │    │    │    │     │    │    │    │    │    │    │    │
+// ├────┼────┼────┼────┼────┼────┼────┘     └────┼────┼────┼────┼────┼────┼────┤
+// │    │    │    │    │    │    │               │    │    │    │    │    │    │
+// ├────┼────┼────┼────┼────┼────┘               └────┼────┼────┼────┼────┼────┤
+// │    │    │    │    │    │ ┌─────────┐ ┌─────────┐ │    │    │    │    │    │
+// └────┴────┴────┴────┴────┘ │         │ │         │ └────┴────┴────┴────┴────┘
+//                       ┌────┼────┬────┤ ├────┬────┼────┐
+//                       │    │    │    │ │    │    │    │
+//                       └────┴────┴────┘ └────┴────┴────┘
 
 fn render_keyboard(
     keys: &[layout::Key],
@@ -383,11 +402,10 @@ fn render_keyboard(
     }
 
     // Gap constants (see coordinate derivation in header comment above)
-    const MAIN_GAP: &str = "       "; //  7 chars
-    const ROW3_GAP: &str = "                 "; // 17 chars
-    const ROW4_GAP: &str = "                           "; // 27 chars
-    const THM_L_PAD: &str = "                    "; // 20 chars
-    const THM_M_GAP: &str = "       "; //  7 chars
+    const MAIN_GAP: &str = "     "; //  5 chars
+    const ROW3_GAP: &str = "               "; // 15 chars
+    const THM_L_PAD: &str = "                      "; // 22 chars
+    const THM_M_GAP: &str = " "; //  1 char
 
     let left_main: [&[usize]; 3] = [
         &[0, 1, 2, 3, 4, 5, 6],
@@ -460,6 +478,7 @@ fn render_keyboard(
         ROW3_GAP,
         border_row(6, '└', '┼', '┤')
     )));
+    // Row 4 content with wide thumb key tops integrated inline
     {
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.extend(content_line(
@@ -469,7 +488,7 @@ fn render_keyboard(
             pressed,
             long_held,
         ));
-        spans.push(Span::raw(ROW4_GAP));
+        spans.push(Span::raw(" ┌─────────┐ ┌─────────┐ "));
         spans.extend(content_line(
             keys,
             base_keys,
@@ -479,44 +498,19 @@ fn render_keyboard(
         ));
         lines.push(Line::from(spans));
     }
-    lines.push(Line::from(format!(
-        "{}{}{}",
-        row_bot(5),
-        ROW4_GAP,
-        row_bot(5)
-    )));
-
-    // Thumb clusters: wide key (2 cells) above the inner 2 small keys; 1 small key sticks out
-    // on the outer side. Total thumb width = 3 keys = 16 chars.
-    //
-    // Left (32=wide above 34,35; 33=outer):   Right (68=wide above 69,70; 71=outer):
-    //      ┌─────────┐                         ┌─────────┐
-    // ┌────┼────┬────┤                         ├────┬────┼────┐
-    // │    │    │    │                         │    │    │    │
-    // └────┴────┴────┘                         └────┴────┴────┘
-    let wide_inner = 9usize; // 5*2 - 1
-    let wide_inner_s = "─".repeat(wide_inner);
-    // top: 5 spaces + wide border = 16 chars (left); wide border + 5 spaces = 16 chars (right)
-    let l_wide_top = format!("     ┌{}┐", wide_inner_s);
-    let r_wide_top = format!("┌{}┐     ", wide_inner_s);
-    // transition lines: combines outer-small top corner with wide bottom
-    let l_wide_mid = "┌────┼────┬────┤"; // outer small ┌, cross at wide-left ┼, small mid ┬, cap ┤
-    let r_wide_mid = "├────┬────┼────┐"; // cap ├, small mid ┬, cross at wide-right ┼, outer small ┐
-    let small_bot = row_bot(3);
-
-    // top of wide keys
-    lines.push(Line::from(format!(
-        "{}{}{}{}",
-        THM_L_PAD, l_wide_top, THM_M_GAP, r_wide_top
-    )));
-    // content of wide keys (label centered in wide_inner chars)
+    // Row 4 bottom with wide thumb key labels integrated inline
     {
         let wl = 32usize;
         let wr = 68usize;
         let wl_bk = base_keys.and_then(|bks| bks.get(wl));
         let wr_bk = base_keys.and_then(|bks| bks.get(wr));
         let (l_label, l_style) = if long_held.contains(&wl) {
-            (format!("{:^9}", wl), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+            (
+                format!("{:^9}", wl),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             (
                 format!("{:^9}", key_label(&keys[wl], wl_bk).trim()),
@@ -524,7 +518,12 @@ fn render_keyboard(
             )
         };
         let (r_label, r_style) = if long_held.contains(&wr) {
-            (format!("{:^9}", wr), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+            (
+                format!("{:^9}", wr),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             (
                 format!("{:^9}", key_label(&keys[wr], wr_bk).trim()),
@@ -532,16 +531,26 @@ fn render_keyboard(
             )
         };
         lines.push(Line::from(vec![
-            Span::raw(THM_L_PAD),
-            Span::raw("     │"),
+            Span::raw(row_bot(5)),
+            Span::raw(" │"),
             Span::styled(l_label, l_style),
-            Span::raw("│"),
-            Span::raw(THM_M_GAP),
-            Span::raw("│"),
+            Span::raw("│ │"),
             Span::styled(r_label, r_style),
-            Span::raw("│     "),
+            Span::raw("│ "),
+            Span::raw(row_bot(5)),
         ]));
     }
+
+    // Thumb clusters: wide key shown inline above; only small 3-key clusters remain below.
+    //
+    // Left (32=wide inline; 33=outer, 34,35=inner):  Right (68=wide inline; 69,70=inner, 71=outer):
+    // ┌────┼────┬────┤                               ├────┬────┼────┐
+    // │    │    │    │                               │    │    │    │
+    // └────┴────┴────┘                               └────┴────┴────┘
+    let l_wide_mid = "┌────┼────┬────┤"; // outer small ┌, cross at wide-left ┼, small mid ┬, cap ┤
+    let r_wide_mid = "├────┬────┼────┐"; // cap ├, small mid ┬, cross at wide-right ┼, outer small ┐
+    let small_bot = row_bot(3);
+
     // transition: wide bottom merged with small keys top
     lines.push(Line::from(format!(
         "{}{}{}{}",
