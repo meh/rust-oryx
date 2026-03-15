@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{Event as CEvent, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -79,31 +79,6 @@ const CODE_LANGS: &[CodeLangConfig] = &[
 
 // ── Training modes ────────────────────────────────────────────────────────────
 
-const MODES: &[(&str, &str)] = &[
-    ("Finite", "Type a set number of words"),
-    ("Infinite", "LLM generates text continuously"),
-    ("Flash", "Press each displayed key"),
-    ("Symbols", "Practice typing symbols"),
-    ("N-grams", "LLM-generated letter patterns"),
-    ("Code", "Type programming code"),
-];
-const MODE_FINITE: usize = 0;
-const MODE_INFINITE: usize = 1;
-const MODE_FLASH: usize = 2;
-const MODE_SYMBOLS: usize = 3;
-const MODE_NGRAMS: usize = 4;
-const MODE_CODE: usize = 5;
-
-#[allow(dead_code)]
-fn is_llm_mode(idx: usize) -> bool {
-    matches!(idx, MODE_FINITE | MODE_INFINITE | MODE_CODE | MODE_NGRAMS)
-}
-
-/// Modes that show the text prompt input box.
-fn shows_prompt_input(idx: usize) -> bool {
-    matches!(idx, MODE_FINITE | MODE_INFINITE | MODE_CODE)
-}
-
 const NGRAM_KINDS: &[&str] = &["bigrams", "trigrams", "words"];
 
 const SYMBOLS: &str = "!@#$%^&*()_+-=[]{}|;':\",./<>?`~";
@@ -132,14 +107,29 @@ struct TrainConfig {
     prompts: Vec<String>,
     stats_file: Option<String>,
     accent_color: Option<String>,
+    highlight_color: Option<String>,
+    stats_window: Option<usize>,
 }
 
 fn parse_rgb(s: &str) -> Option<(u8, u8, u8)> {
-    let mut it = s.splitn(3, ',');
-    let r = it.next()?.trim().parse().ok()?;
-    let g = it.next()?.trim().parse().ok()?;
-    let b = it.next()?.trim().parse().ok()?;
-    Some((r, g, b))
+    let s = s.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some((r, g, b))
+    } else {
+        None
+    }
+}
+
+fn readable_fg(r: u8, g: u8, b: u8) -> Color {
+    let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    if lum > 128.0 {
+        Color::Black
+    } else {
+        Color::White
+    }
 }
 
 fn load_config(path: &PathBuf) -> Config {
@@ -151,9 +141,17 @@ fn load_config(path: &PathBuf) -> Config {
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Delete the recorded stats file.
+    ClearStats,
+}
+
 #[derive(Parser)]
 #[command(about = "Typing trainer powered by LLM")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
     #[arg(long, env = "ORYX_TRAIN_PROVIDER")]
     provider: Option<String>,
     #[arg(long, env = "ORYX_TRAIN_MODEL")]
@@ -168,9 +166,15 @@ struct Cli {
     extra_prompts: Vec<String>,
     #[arg(long, env = "ORYX_TRAIN_STATS_FILE")]
     stats_file: Option<PathBuf>,
-    /// Accent color for active pane borders and keyboard LED highlight, as R,G,B (0–255 each). E.g. "0,200,255".
+    /// Accent color for active pane borders/titles, as a hex color. E.g. "00c8ff".
     #[arg(long, env = "ORYX_TRAIN_ACCENT_COLOR")]
     accent_color: Option<String>,
+    /// Keyboard LED color for the next key to press, as a hex color. Defaults to accent color.
+    #[arg(long, env = "ORYX_TRAIN_HIGHLIGHT_COLOR")]
+    highlight_color: Option<String>,
+    /// Number of recent sessions to average in the stats bar.
+    #[arg(long, env = "ORYX_TRAIN_STATS_WINDOW")]
+    stats_window: Option<usize>,
 }
 
 // ── Provider / model helpers ──────────────────────────────────────────────────
@@ -207,7 +211,7 @@ fn default_model(provider: &str) -> String {
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SessionStats {
     timestamp_unix: u64,
     mode: String,
@@ -233,6 +237,16 @@ fn save_stats(path: &PathBuf, stats: &SessionStats) -> Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+fn load_recent_stats(path: &PathBuf, n: usize) -> Vec<SessionStats> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let all: Vec<SessionStats> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let skip = all.len().saturating_sub(n);
+    all.into_iter().skip(skip).collect()
 }
 
 // ── Syntax highlighting (tree-sitter) ─────────────────────────────────────────
@@ -441,7 +455,12 @@ fn qmk_keycode_to_char(code: &str) -> Option<char> {
 fn build_keymap(layout: &oryx_hid::Layout) -> Keymap {
     let revision = match &layout.revision {
         Some(r) => r,
-        None => return Keymap { layers: Vec::new(), shift_leds: Vec::new() },
+        None => {
+            return Keymap {
+                layers: Vec::new(),
+                shift_leds: Vec::new(),
+            };
+        }
     };
     let mut shift_leds: Vec<u8> = Vec::new();
     let layers = revision
@@ -482,6 +501,55 @@ enum Mode {
     Symbols,
     Ngrams,
     Code,
+}
+
+impl Mode {
+    const ALL: &'static [Mode] = &[
+        Mode::Finite,
+        Mode::Infinite,
+        Mode::Flash,
+        Mode::Symbols,
+        Mode::Ngrams,
+        Mode::Code,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Finite => "Finite",
+            Mode::Infinite => "Infinite",
+            Mode::Flash => "Flash",
+            Mode::Symbols => "Symbols",
+            Mode::Ngrams => "N-grams",
+            Mode::Code => "Code",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Mode::Finite => "Type a set number of words",
+            Mode::Infinite => "LLM generates text continuously",
+            Mode::Flash => "Press each displayed key",
+            Mode::Symbols => "Practice typing symbols",
+            Mode::Ngrams => "LLM-generated letter patterns",
+            Mode::Code => "Type programming code",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|&m| m == self).unwrap()
+    }
+}
+
+#[allow(dead_code)]
+fn is_llm_mode(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Finite | Mode::Infinite | Mode::Code | Mode::Ngrams
+    )
+}
+
+fn shows_prompt_input(mode: Mode) -> bool {
+    matches!(mode, Mode::Finite | Mode::Infinite | Mode::Code)
 }
 
 struct TypingSession {
@@ -671,13 +739,13 @@ impl TypingSession {
         }
     }
 
-    fn to_stats(&self, mode_name: &str) -> SessionStats {
+    fn to_stats(&self) -> SessionStats {
         SessionStats {
             timestamp_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            mode: mode_name.to_string(),
+            mode: self.mode.name().to_string(),
             duration_secs: self.elapsed().as_secs_f64(),
             wpm: self.wpm(),
             accuracy: self.accuracy(),
@@ -803,7 +871,7 @@ enum ConfigFocus {
 }
 
 struct ConfigState {
-    mode_idx: usize,
+    mode: Mode,
     lang_idx: usize,
     code_lang_idx: usize,
     options_idx: usize,
@@ -820,55 +888,53 @@ struct ConfigState {
 
 impl ConfigState {
     fn option_count(&self) -> usize {
-        match self.mode_idx {
-            MODE_FINITE => 2,
-            MODE_INFINITE => 1,
-            MODE_FLASH => 1,
-            MODE_SYMBOLS => 1,
-            MODE_NGRAMS => 2,
-            MODE_CODE => 1,
-            _ => 0,
+        match self.mode {
+            Mode::Finite => 2,
+            Mode::Infinite => 1,
+            Mode::Flash => 0, // no options - charset removed
+            Mode::Symbols => 1,
+            Mode::Ngrams => 2,
+            Mode::Code => 1,
         }
     }
 
     fn option_items(&self) -> Vec<(&'static str, String)> {
-        match self.mode_idx {
-            MODE_FINITE => vec![
+        match self.mode {
+            Mode::Finite => vec![
                 ("Language", LANGUAGES[self.lang_idx].name.to_string()),
                 ("Words", self.word_count.to_string()),
             ],
-            MODE_INFINITE => vec![("Language", LANGUAGES[self.lang_idx].name.to_string())],
-            MODE_FLASH => vec![("Charset", LANGUAGES[self.lang_idx].name.to_string())],
-            MODE_SYMBOLS => vec![("Length", self.symbol_len.to_string())],
-            MODE_NGRAMS => vec![
+            Mode::Infinite => vec![("Language", LANGUAGES[self.lang_idx].name.to_string())],
+            Mode::Flash => vec![],
+            Mode::Symbols => vec![("Length", self.symbol_len.to_string())],
+            Mode::Ngrams => vec![
                 ("Type", NGRAM_KINDS[self.ngram_kind].to_string()),
                 ("Count", self.ngram_count.to_string()),
             ],
-            MODE_CODE => vec![("Language", CODE_LANGS[self.code_lang_idx].name.to_string())],
-            _ => vec![],
+            Mode::Code => vec![("Language", CODE_LANGS[self.code_lang_idx].name.to_string())],
         }
     }
 
     fn adjust_option(&mut self, delta: i32) {
-        match (self.mode_idx, self.options_idx) {
-            (MODE_FINITE, 0) | (MODE_INFINITE, 0) | (MODE_FLASH, 0) => {
+        match (self.mode, self.options_idx) {
+            (Mode::Finite, 0) | (Mode::Infinite, 0) => {
                 let n = LANGUAGES.len() as i32;
                 self.lang_idx = ((self.lang_idx as i32 + delta).rem_euclid(n)) as usize;
             }
-            (MODE_FINITE, 1) => {
+            (Mode::Finite, 1) => {
                 self.word_count = (self.word_count as i32 + delta * 10).clamp(10, 500) as usize;
             }
-            (MODE_SYMBOLS, 0) => {
+            (Mode::Symbols, 0) => {
                 self.symbol_len = (self.symbol_len as i32 + delta * 10).clamp(10, 300) as usize;
             }
-            (MODE_NGRAMS, 0) => {
+            (Mode::Ngrams, 0) => {
                 let n = NGRAM_KINDS.len() as i32;
                 self.ngram_kind = ((self.ngram_kind as i32 + delta).rem_euclid(n)) as usize;
             }
-            (MODE_NGRAMS, 1) => {
+            (Mode::Ngrams, 1) => {
                 self.ngram_count = (self.ngram_count as i32 + delta * 5).clamp(5, 200) as usize;
             }
-            (MODE_CODE, 0) => {
+            (Mode::Code, 0) => {
                 let n = CODE_LANGS.len() as i32;
                 self.code_lang_idx = ((self.code_lang_idx as i32 + delta).rem_euclid(n)) as usize;
             }
@@ -921,8 +987,12 @@ struct App {
     keymap: Option<Keymap>,
     /// Currently active layer reported by the keyboard.
     current_layer: u8,
-    /// Accent color used for active pane borders/titles and keyboard LED highlight.
+    /// Accent color used for active pane borders/titles and status bars.
     accent_color: (u8, u8, u8),
+    /// Keyboard LED color for the next key to press.
+    highlight_color: (u8, u8, u8),
+    stats_window: usize,
+    recent_stats: Vec<SessionStats>,
 }
 
 // ── Keyboard LED helpers ───────────────────────────────────────────────────────
@@ -942,7 +1012,7 @@ fn update_kbd_led(app: &App) {
     let Some(led_idx) = km.find_key(app.current_layer, ch) else {
         return;
     };
-    let (r, g, b) = app.accent_color;
+    let (r, g, b) = app.highlight_color;
     let _ = kb_tx.send(KbCmd::ClearAll);
     let _ = kb_tx.send(KbCmd::SetLed(led_idx, r, g, b));
     if ch.is_uppercase() {
@@ -1063,19 +1133,19 @@ fn spawn_llm_stream(
 // ── System prompt builders ────────────────────────────────────────────────────
 
 fn build_system_prompt(app: &App) -> String {
-    match app.cfg.mode_idx {
-        MODE_CODE => format!(
+    match app.cfg.mode {
+        Mode::Code => format!(
             "You are a code snippet generator for typing practice. Generate a short, \
              clean, well-formatted {} code snippet suitable for typing. Use proper \
              indentation with spaces. Use only printable ASCII characters. Output only \
              the code with no explanations, no markdown, no code fences.",
             CODE_LANGS[app.cfg.code_lang_idx].name
         ),
-        MODE_FINITE => format!(
+        Mode::Finite => format!(
             "{} Generate exactly {} words.",
             LANGUAGES[app.cfg.lang_idx].system_prompt, app.cfg.word_count
         ),
-        MODE_NGRAMS => {
+        Mode::Ngrams => {
             let kind = NGRAM_KINDS[app.cfg.ngram_kind];
             format!(
                 "You are a typing practice text generator. Generate exactly {} {kind} \
@@ -1101,8 +1171,18 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_config(f: &mut Frame, app: &App) {
     let area = f.area();
     let cfg = &app.cfg;
-    let show_prompt = shows_prompt_input(cfg.mode_idx);
-    let accent = { let (r, g, b) = app.accent_color; Color::Rgb(r, g, b) };
+    let show_prompt = shows_prompt_input(cfg.mode);
+    let accent = {
+        let (r, g, b) = app.accent_color;
+        Color::Rgb(r, g, b)
+    };
+
+    let top_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let stats_row = top_split[0];
+    let content_area = top_split[1];
 
     let error_h = if app.status_msg.is_empty() { 0 } else { 1 };
     let outer = Layout::default()
@@ -1110,26 +1190,60 @@ fn draw_config(f: &mut Frame, app: &App) {
         .margin(1)
         .constraints(if show_prompt {
             vec![
-                Constraint::Length(error_h),
-                Constraint::Min(8),
-                Constraint::Length(4),
-                Constraint::Min(3),
-                Constraint::Length(1),
+                Constraint::Length(error_h), // error
+                Constraint::Min(8),          // top (mode list + options)
+                Constraint::Length(4),       // prompt input
+                Constraint::Min(3),          // samples
+                Constraint::Length(1),       // help
             ]
         } else {
             vec![
-                Constraint::Length(error_h),
-                Constraint::Min(8),
-                Constraint::Length(1),
+                Constraint::Length(error_h), // error
+                Constraint::Min(8),          // top
+                Constraint::Length(1),       // help
             ]
         })
-        .split(area);
+        .split(content_area);
 
     let (err_row, top_row, prompt_row, samples_row, help_row) = if show_prompt {
         (outer[0], outer[1], outer[2], outer[3], outer[4])
     } else {
         (outer[0], outer[1], outer[1], outer[1], outer[2])
     };
+
+    // Stats bar
+    {
+        let (ar, ag, ab) = app.accent_color;
+        let bar_bg = Color::Rgb(ar, ag, ab);
+        let bar_fg = readable_fg(ar, ag, ab);
+        let bar_style = Style::default()
+            .fg(bar_fg)
+            .bg(bar_bg)
+            .add_modifier(Modifier::BOLD);
+        let stats_text = if app.recent_stats.is_empty() {
+            " No recent sessions".to_string()
+        } else {
+            let n = app.recent_stats.len();
+            let avg_wpm = app.recent_stats.iter().map(|s| s.wpm).sum::<f64>() / n as f64;
+            let avg_acc = app.recent_stats.iter().map(|s| s.accuracy).sum::<f64>() / n as f64;
+            let best_wpm = app
+                .recent_stats
+                .iter()
+                .map(|s| s.wpm)
+                .fold(f64::NEG_INFINITY, f64::max);
+            format!(
+                " Last {n}:  WPM: {:5.1}  |  Accuracy: {:5.1}%  |  Best: {:5.1} ",
+                avg_wpm,
+                avg_acc * 100.0,
+                best_wpm,
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(stats_text, bar_style)))
+                .style(Style::default().bg(bar_bg)),
+            stats_row,
+        );
+    }
 
     if !app.status_msg.is_empty() {
         f.render_widget(
@@ -1141,7 +1255,7 @@ fn draw_config(f: &mut Frame, app: &App) {
         );
     }
 
-    let mode_col_w = MODES.iter().map(|(n, _)| n.len()).max().unwrap_or(8) as u16 + 4;
+    let mode_col_w = Mode::ALL.iter().map(|m| m.name().len()).max().unwrap_or(8) as u16 + 4;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(mode_col_w), Constraint::Min(20)])
@@ -1150,19 +1264,16 @@ fn draw_config(f: &mut Frame, app: &App) {
     // Mode list
     {
         let mode_focused = cfg.focus == ConfigFocus::ModeList;
-        let items: Vec<ListItem> = MODES
+        let items: Vec<ListItem> = Mode::ALL
             .iter()
-            .enumerate()
-            .map(|(i, (name, _))| {
-                let sel = i == cfg.mode_idx;
+            .map(|&mode| {
+                let sel = mode == cfg.mode;
                 let style = match (mode_focused, sel) {
-                    (true, true) => Style::default()
-                        .fg(accent)
-                        .add_modifier(Modifier::BOLD),
+                    (true, true) => Style::default().fg(accent).add_modifier(Modifier::BOLD),
                     (_, true) => Style::default().fg(Color::White),
                     _ => Style::default().fg(Color::DarkGray),
                 };
-                ListItem::new(Line::from(Span::styled(name.to_string(), style)))
+                ListItem::new(Line::from(Span::styled(mode.name().to_string(), style)))
             })
             .collect();
         f.render_widget(
@@ -1191,9 +1302,7 @@ fn draw_config(f: &mut Frame, app: &App) {
                 let sel = opt_focused && i == cfg.options_idx;
                 let (label_style, val_style) = if sel {
                     (
-                        Style::default()
-                            .fg(accent)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
@@ -1215,7 +1324,7 @@ fn draw_config(f: &mut Frame, app: &App) {
                 ])
             })
             .collect();
-        let options_title = format!(" {} ", MODES[cfg.mode_idx].1);
+        let options_title = format!(" {} ", cfg.mode.description());
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
@@ -1282,9 +1391,7 @@ fn draw_config(f: &mut Frame, app: &App) {
                         s.clone()
                     };
                     let style = if i == cfg.sample_idx && cfg.focus == ConfigFocus::Prompt {
-                        Style::default()
-                            .fg(accent)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
@@ -1298,16 +1405,17 @@ fn draw_config(f: &mut Frame, app: &App) {
         }
     }
 
+    let hint_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
     let help = Line::from(vec![
-        Span::styled("[Tab]", Style::default().fg(accent)),
+        Span::styled("[Tab]", hint_style),
         Span::raw(" switch  "),
-        Span::styled("[↑↓]", Style::default().fg(accent)),
+        Span::styled("[↑↓]", hint_style),
         Span::raw(" navigate  "),
-        Span::styled("[←→]", Style::default().fg(accent)),
+        Span::styled("[←→]", hint_style),
         Span::raw(" adjust  "),
-        Span::styled("[Enter]", Style::default().fg(accent)),
+        Span::styled("[Enter]", hint_style),
         Span::raw(" start  "),
-        Span::styled("[Esc]", Style::default().fg(accent)),
+        Span::styled("[Esc]", hint_style),
         Span::raw(" quit"),
     ]);
     f.render_widget(Paragraph::new(help), help_row);
@@ -1324,8 +1432,17 @@ fn draw_typing(f: &mut Frame, app: &App) {
         None => return,
     };
 
+    let (ar, ag, ab) = app.accent_color;
+    let bar_bg = Color::Rgb(ar, ag, ab);
+    let bar_fg = readable_fg(ar, ag, ab);
+    let bar_style = Style::default()
+        .fg(bar_fg)
+        .bg(bar_bg)
+        .add_modifier(Modifier::BOLD);
+    let accent = bar_bg;
+
     if session.mode == Mode::Flash {
-        draw_flash_typing(f, session);
+        draw_flash_typing(f, session, bar_style, accent);
         return;
     }
 
@@ -1348,10 +1465,8 @@ fn draw_typing(f: &mut Frame, app: &App) {
         .split(area);
 
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            status,
-            Style::default().fg(Color::Black).bg(Color::White),
-        ))),
+        Paragraph::new(Line::from(Span::styled(status, bar_style)))
+            .style(Style::default().bg(bar_bg)),
         chunks[0],
     );
 
@@ -1401,19 +1516,29 @@ fn draw_typing(f: &mut Frame, app: &App) {
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[Backspace]", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "[Backspace]",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" correct  "),
-            Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "[Esc]",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" stop"),
         ])),
         chunks[2],
     );
 }
 
-fn draw_flash_typing(f: &mut Frame, session: &TypingSession) {
+fn draw_flash_typing(f: &mut Frame, session: &TypingSession, bar_style: Style, accent: Color) {
     let area = f.area();
     let pos = session.typed.len();
     let total = session.target.len();
+    let bar_bg = match bar_style.bg {
+        Some(c) => c,
+        None => Color::White,
+    };
 
     let status = format!(
         " Progress: {pos}/{total}  |  Correct: {}  |  Errors: {}  |  Accuracy: {:.1}%  |  WPM: {:.1} ",
@@ -1433,10 +1558,8 @@ fn draw_flash_typing(f: &mut Frame, session: &TypingSession) {
         .split(area);
 
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            status,
-            Style::default().fg(Color::Black).bg(Color::White),
-        ))),
+        Paragraph::new(Line::from(Span::styled(status, bar_style)))
+            .style(Style::default().bg(bar_bg)),
         chunks[0],
     );
 
@@ -1469,7 +1592,10 @@ fn draw_flash_typing(f: &mut Frame, session: &TypingSession) {
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "[Esc]",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" stop"),
         ])),
         chunks[2],
@@ -1478,20 +1604,16 @@ fn draw_flash_typing(f: &mut Frame, session: &TypingSession) {
 
 fn draw_done(f: &mut Frame, app: &App) {
     let area = f.area();
+    let accent = {
+        let (r, g, b) = app.accent_color;
+        Color::Rgb(r, g, b)
+    };
     let session = match app.typing.as_ref() {
         Some(s) => s,
         None => return,
     };
 
-    let mode_name = MODES[match session.mode {
-        Mode::Finite => MODE_FINITE,
-        Mode::Infinite => MODE_INFINITE,
-        Mode::Flash => MODE_FLASH,
-        Mode::Symbols => MODE_SYMBOLS,
-        Mode::Ngrams => MODE_NGRAMS,
-        Mode::Code => MODE_CODE,
-    }]
-    .0;
+    let mode_name = session.mode.name();
 
     let mut content = vec![
         Line::from(""),
@@ -1525,10 +1647,11 @@ fn draw_done(f: &mut Frame, app: &App) {
     }
 
     content.push(Line::from(""));
+    let hint_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
     content.push(Line::from(vec![
-        Span::styled("[Enter] / [Esc]", Style::default().fg(Color::Yellow)),
+        Span::styled("[Enter] / [Esc]", hint_style),
         Span::raw(" back  "),
-        Span::styled("[q]", Style::default().fg(Color::Yellow)),
+        Span::styled("[q]", hint_style),
         Span::raw(" quit"),
     ]));
 
@@ -1544,9 +1667,12 @@ fn draw_done(f: &mut Frame, app: &App) {
 
 fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
     app.status_msg.clear();
-    match app.cfg.mode_idx {
-        MODE_FLASH => {
-            // Use keyboard layout chars when connected, otherwise fall back to a-z.
+    match app.cfg.mode {
+        Mode::Flash => {
+            if app.keymap.is_none() {
+                app.status_msg = "Flash mode requires a connected keyboard.".into();
+                return;
+            }
             let flash_chars: Vec<char> = app
                 .keymap
                 .as_ref()
@@ -1556,27 +1682,27 @@ fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
                     chars
                 })
                 .filter(|chars| !chars.is_empty())
-                .unwrap_or_else(|| ('a'..='z').collect());
+                .unwrap_or_default();
+            if flash_chars.is_empty() {
+                app.status_msg = "No alphabetic keys found in keyboard layout.".into();
+                return;
+            }
             let text = generate_flash_sequence(&flash_chars, 100);
-            app.typing = Some(TypingSession::new_local(
-                text,
-                Mode::Flash,
-                format!("Flash/{}", LANGUAGES[app.cfg.lang_idx].name),
-            ));
+            app.typing = Some(TypingSession::new_local(text, Mode::Flash, "Flash".into()));
             app.screen = Screen::Typing;
             update_kbd_led(app);
         }
-        MODE_SYMBOLS => {
+        Mode::Symbols => {
             let text = generate_symbols(app.cfg.symbol_len);
             app.typing = Some(TypingSession::new_local(
                 text,
                 Mode::Symbols,
-                "Symbols".to_string(),
+                "Symbols".into(),
             ));
             app.screen = Screen::Typing;
             update_kbd_led(app);
         }
-        MODE_NGRAMS => {
+        Mode::Ngrams => {
             let sys = build_system_prompt(app);
             let user = format!(
                 "Generate {} {}.",
@@ -1602,22 +1728,9 @@ fn start_session(app: &mut App, tx: &mpsc::UnboundedSender<AppMsg>) {
                 app.base_url.clone(),
             );
         }
-        idx => {
-            let mode = match idx {
-                MODE_FINITE => Mode::Finite,
-                MODE_INFINITE => Mode::Infinite,
-                _ => Mode::Code,
-            };
-            let word_limit = if idx == MODE_FINITE {
-                Some(app.cfg.word_count)
-            } else {
-                None
-            };
-            let code_lang_idx = if idx == MODE_CODE {
-                Some(app.cfg.code_lang_idx)
-            } else {
-                None
-            };
+        mode => {
+            let word_limit = (mode == Mode::Finite).then_some(app.cfg.word_count);
+            let code_lang_idx = (mode == Mode::Code).then_some(app.cfg.code_lang_idx);
             let sys = build_system_prompt(app);
             let user = app.cfg.prompt_buf.trim().to_string();
             let session = TypingSession::new_streaming(
@@ -1684,15 +1797,35 @@ async fn main() -> Result<()> {
         .and_then(parse_rgb)
         .unwrap_or((0, 200, 255));
 
+    let highlight_color = cli
+        .highlight_color
+        .as_deref()
+        .or(config.train.highlight_color.as_deref())
+        .and_then(parse_rgb)
+        .unwrap_or(accent_color);
+
+    if let Some(Commands::ClearStats) = cli.command {
+        if stats_file.exists() {
+            std::fs::remove_file(&stats_file)?;
+            println!("Stats cleared: {}", stats_file.display());
+        } else {
+            println!("No stats file found at {}", stats_file.display());
+        }
+        return Ok(());
+    }
+
+    let stats_window = cli.stats_window.or(config.train.stats_window).unwrap_or(10);
+    let recent_stats = load_recent_stats(&stats_file, stats_window);
+
     let mut samples: Vec<String> = config.train.prompts;
     samples.extend(cli.extra_prompts);
     if samples.is_empty() {
         samples = vec![
-            "Generate a 100-word typing exercise using common English words.".into(),
-            "Write a short passage about nature for typing practice, about 80 words.".into(),
-            "Create a typing exercise about everyday activities, about 100 words.".into(),
-            "Generate a passage about technology and computers, about 100 words.".into(),
-            "Write a short motivational passage for typing practice, about 80 words.".into(),
+            "Generate a typing exercise using common English words.".into(),
+            "Write a short passage about nature for typing practice.".into(),
+            "Create a typing exercise about everyday activities.".into(),
+            "Generate a passage about technology and computers.".into(),
+            "Write a short motivational passage for typing practice.".into(),
         ];
     }
 
@@ -1702,7 +1835,7 @@ async fn main() -> Result<()> {
     let mut app = App {
         screen: Screen::Config,
         cfg: ConfigState {
-            mode_idx: 0,
+            mode: Mode::Finite,
             lang_idx: 0,
             code_lang_idx: 0,
             options_idx: 0,
@@ -1728,6 +1861,9 @@ async fn main() -> Result<()> {
         keymap: None,
         current_layer: 0,
         accent_color,
+        highlight_color,
+        stats_window,
+        recent_stats,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
@@ -1826,7 +1962,7 @@ async fn main() -> Result<()> {
                                     cfg.focus = match cfg.focus {
                                         ConfigFocus::ModeList => ConfigFocus::Options,
                                         ConfigFocus::Options
-                                            if shows_prompt_input(cfg.mode_idx) =>
+                                            if shows_prompt_input(cfg.mode) =>
                                         {
                                             ConfigFocus::Prompt
                                         }
@@ -1836,7 +1972,7 @@ async fn main() -> Result<()> {
                                     };
                                 }
                                 KeyCode::Enter => {
-                                    let prompt_ok = !shows_prompt_input(cfg.mode_idx)
+                                    let prompt_ok = !shows_prompt_input(cfg.mode)
                                         || !cfg.prompt_buf.trim().is_empty();
                                     if prompt_ok {
                                         start_session(&mut app, &tx);
@@ -1845,14 +1981,16 @@ async fn main() -> Result<()> {
                                 _ => match cfg.focus {
                                     ConfigFocus::ModeList => match key.code {
                                         KeyCode::Up => {
-                                            if cfg.mode_idx > 0 {
-                                                cfg.mode_idx -= 1;
+                                            let idx = cfg.mode.index();
+                                            if idx > 0 {
+                                                cfg.mode = Mode::ALL[idx - 1];
                                                 cfg.options_idx = 0;
                                             }
                                         }
                                         KeyCode::Down => {
-                                            if cfg.mode_idx + 1 < MODES.len() {
-                                                cfg.mode_idx += 1;
+                                            let idx = cfg.mode.index();
+                                            if idx + 1 < Mode::ALL.len() {
+                                                cfg.mode = Mode::ALL[idx + 1];
                                                 cfg.options_idx = 0;
                                             }
                                         }
@@ -1923,14 +2061,7 @@ async fn main() -> Result<()> {
                                 } else {
                                     if let Some(ref mut s) = app.typing {
                                         s.force_done();
-                                        let stats = s.to_stats(MODES[match s.mode {
-                                            Mode::Finite   => MODE_FINITE,
-                                            Mode::Infinite => MODE_INFINITE,
-                                            Mode::Flash    => MODE_FLASH,
-                                            Mode::Symbols  => MODE_SYMBOLS,
-                                            Mode::Ngrams   => MODE_NGRAMS,
-                                            Mode::Code     => MODE_CODE,
-                                        }].0);
+                                        let stats = s.to_stats();
                                         match save_stats(&app.stats_file, &stats) {
                                             Ok(()) => app.stats_save_error = None,
                                             Err(e) => {
@@ -1976,16 +2107,7 @@ async fn main() -> Result<()> {
                                 }
                                 update_kbd_led(&app);
                                 if complete {
-                                    let stats = app.typing.as_ref().unwrap().to_stats(
-                                        MODES[match app.typing.as_ref().unwrap().mode {
-                                            Mode::Finite   => MODE_FINITE,
-                                            Mode::Infinite => MODE_INFINITE,
-                                            Mode::Flash    => MODE_FLASH,
-                                            Mode::Symbols  => MODE_SYMBOLS,
-                                            Mode::Ngrams   => MODE_NGRAMS,
-                                            Mode::Code     => MODE_CODE,
-                                        }].0,
-                                    );
+                                    let stats = app.typing.as_ref().unwrap().to_stats();
                                     match save_stats(&app.stats_file, &stats) {
                                         Ok(()) => app.stats_save_error = None,
                                         Err(e) => app.stats_save_error = Some(e.to_string()),
@@ -1999,6 +2121,7 @@ async fn main() -> Result<()> {
                         Screen::Done => match key.code {
                             KeyCode::Char('q') => break,
                             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('r') => {
+                                app.recent_stats = load_recent_stats(&app.stats_file, app.stats_window);
                                 app.typing = None;
                                 app.stats_save_error = None;
                                 app.screen = Screen::Config;
