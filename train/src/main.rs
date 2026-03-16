@@ -22,7 +22,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use serde::{Deserialize, Serialize};
@@ -715,6 +715,8 @@ struct TypingSession {
     error_count: usize,
     /// Last keypress in flash mode was wrong.
     last_was_error: bool,
+    /// User pressed a non-Enter key while cursor is on a newline.
+    newline_error: bool,
     mode: Mode,
     /// Streaming state for LLM modes.
     streaming: bool,
@@ -750,6 +752,7 @@ impl TypingSession {
             finish_time: None,
             error_count: 0,
             last_was_error: false,
+            newline_error: false,
             mode,
             streaming: false,
             stream_done: true,
@@ -780,6 +783,7 @@ impl TypingSession {
             finish_time: None,
             error_count: 0,
             last_was_error: false,
+            newline_error: false,
             mode,
             streaming: true,
             stream_done: false,
@@ -893,6 +897,12 @@ impl TypingSession {
             }
             if c != exp {
                 self.error_count += 1;
+                if exp == '\n' {
+                    self.newline_error = true;
+                    return;
+                }
+            } else if exp == '\n' {
+                self.newline_error = false;
             }
             self.typed.push(c);
             if self.is_complete() {
@@ -1003,11 +1013,24 @@ fn build_typed_lines(session: &TypingSession, width: u16) -> (Vec<Line<'static>>
             if !cur_text.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut cur_text), cur_style));
             }
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            col = 0;
             if tgt_ch == '\n' {
+                if i == pos {
+                    let cursor_bg = if session.newline_error {
+                        Color::Red
+                    } else {
+                        Color::White
+                    };
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().fg(Color::Black).bg(cursor_bg),
+                    ));
+                }
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                col = 0;
                 continue;
             }
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            col = 0;
         }
         let (display_ch, style) = char_display(i, pos, &session.typed, &session.target, base);
         if style != cur_style && !cur_text.is_empty() {
@@ -1625,15 +1648,27 @@ fn draw_config(f: &mut Frame, app: &App) {
             let after: String = chars[(cfg.prompt_cursor + 1).min(chars.len())..]
                 .iter()
                 .collect();
+            let before_lines: Vec<&str> = before.split('\n').collect();
+            let after_lines: Vec<&str> = after.split('\n').collect();
+            let mut para_lines: Vec<Line> = before_lines[..before_lines.len() - 1]
+                .iter()
+                .map(|l| Line::from(l.to_string()))
+                .collect();
+            para_lines.push(Line::from(vec![
+                Span::raw(before_lines.last().copied().unwrap_or("").to_string()),
+                Span::styled(
+                    cursor_ch,
+                    Style::default().fg(Color::Black).bg(Color::White),
+                ),
+                Span::raw(after_lines.first().copied().unwrap_or("").to_string()),
+            ]));
+            para_lines.extend(
+                after_lines[1..]
+                    .iter()
+                    .map(|l| Line::from(l.to_string())),
+            );
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::raw(before),
-                    Span::styled(
-                        cursor_ch,
-                        Style::default().fg(Color::Black).bg(Color::White),
-                    ),
-                    Span::raw(after),
-                ]))
+                Paragraph::new(Text::from(para_lines))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -2281,6 +2316,14 @@ async fn main() -> Result<()> {
                             if let Some(ref mut s) = app.typing {
                                 s.streaming = false;
                                 s.stream_done = true;
+                                // Strip leading/trailing spaces from each line
+                                let text: String = s.target.iter().collect();
+                                let sanitized: String = text
+                                    .split('\n')
+                                    .map(|line| line.trim())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                s.target = sanitized.chars().collect();
                             }
                         }
                         AppMsg::LlmError(e) => {
@@ -2336,7 +2379,9 @@ async fn main() -> Result<()> {
                                         }
                                     };
                                 }
-                                KeyCode::Enter => {
+                                KeyCode::Enter
+                                    if cfg.focus != ConfigFocus::Prompt =>
+                                {
                                     let prompt_ok = !shows_prompt_input(cfg.mode)
                                         || !cfg.prompt_buf.trim().is_empty();
                                     if prompt_ok {
@@ -2439,6 +2484,7 @@ async fn main() -> Result<()> {
                                         KeyCode::End | KeyCode::Char('e') if ctrl => {
                                             cfg.prompt_cursor = cfg.prompt_buf.chars().count();
                                         }
+                                        KeyCode::Enter => cfg.insert_char('\n'),
                                         KeyCode::Char(c) => cfg.insert_char(c),
                                         KeyCode::Backspace => cfg.delete_before_cursor(),
                                         _ => {}
@@ -2479,6 +2525,25 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 update_kbd_led(&app);
+                            }
+                            KeyCode::Enter => {
+                                let mut complete = false;
+                                if let Some(ref mut s) = app.typing {
+                                    if s.mode != Mode::Flash {
+                                        s.type_char('\n');
+                                        complete = s.is_complete();
+                                    }
+                                }
+                                update_kbd_led(&app);
+                                if complete {
+                                    let mode = app.typing.as_ref().unwrap().mode;
+                                    let stats = app.typing.as_ref().unwrap().to_stats();
+                                    match save_stats(&stats_path(&app.stats_file, mode), &stats) {
+                                        Ok(()) => app.stats_save_error = None,
+                                        Err(e) => app.stats_save_error = Some(e.to_string()),
+                                    }
+                                    app.screen = Screen::Done;
+                                }
                             }
                             KeyCode::Char(c) => {
                                 let mut complete = false;
