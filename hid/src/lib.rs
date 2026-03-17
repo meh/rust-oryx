@@ -1,5 +1,6 @@
 pub mod error;
 pub mod layout;
+pub mod matrix;
 pub mod protocol;
 
 pub use error::{Error, Result};
