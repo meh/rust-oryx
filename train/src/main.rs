@@ -1409,10 +1409,7 @@ fn build_system_prompt(app: &App) -> String {
                 app.cfg.word_count
             );
             if !app.cfg.prompt_buf.trim().is_empty() {
-                sys.push_str(&format!(
-                    " Topic or domain: {}.",
-                    app.cfg.prompt_buf.trim()
-                ));
+                sys.push_str(&format!(" Topic or domain: {}.", app.cfg.prompt_buf.trim()));
             }
             sys
         }
@@ -1662,24 +1659,20 @@ fn draw_config(f: &mut Frame, app: &App) {
                 ),
                 Span::raw(after_lines.first().copied().unwrap_or("").to_string()),
             ]));
-            para_lines.extend(
-                after_lines[1..]
-                    .iter()
-                    .map(|l| Line::from(l.to_string())),
-            );
+            para_lines.extend(after_lines[1..].iter().map(|l| Line::from(l.to_string())));
             f.render_widget(
                 Paragraph::new(Text::from(para_lines))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Prompt ")
-                        .border_style(if prompt_focused {
-                            Style::default().fg(accent)
-                        } else {
-                            Style::default()
-                        }),
-                )
-                .wrap(Wrap { trim: false }),
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Prompt ")
+                            .border_style(if prompt_focused {
+                                Style::default().fg(accent)
+                            } else {
+                                Style::default()
+                            }),
+                    )
+                    .wrap(Wrap { trim: false }),
                 prompt_row,
             );
         }
@@ -2133,7 +2126,8 @@ async fn main() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(|| {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("oryx-train")
+            .join("oryx")
+            .join("train")
             .join("config.toml")
     });
     let config = load_config(&config_path);
@@ -2155,7 +2149,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| {
             dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join("oryx-train")
+                .join("oryx")
+                .join("train")
                 .join("stats.jsonl")
         });
 
@@ -2212,11 +2207,11 @@ async fn main() -> Result<()> {
         .unwrap_or(Mode::Prose);
     let prose_prompt = cache.prose_prompt.clone().unwrap_or_default();
     let words_prompt = cache.words_prompt.clone().unwrap_or_default();
-    let code_prompt  = cache.code_prompt.clone().unwrap_or_default();
+    let code_prompt = cache.code_prompt.clone().unwrap_or_default();
     let initial_prompt = match initial_mode {
         Mode::Prose => prose_prompt.clone(),
         Mode::Words => words_prompt.clone(),
-        Mode::Code  => code_prompt.clone(),
+        Mode::Code => code_prompt.clone(),
         _ => String::new(),
     };
     let prompt_buf = if initial_prompt.is_empty() {
@@ -2623,10 +2618,26 @@ async fn main() -> Result<()> {
         let cfg = &app.cfg;
         // Make sure the current mode's prompt is saved.
         let (prose_p, words_p, code_p) = match cfg.mode {
-            Mode::Prose => (cfg.prompt_buf.clone(), cfg.words_prompt.clone(), cfg.code_prompt.clone()),
-            Mode::Words => (cfg.prose_prompt.clone(), cfg.prompt_buf.clone(), cfg.code_prompt.clone()),
-            Mode::Code  => (cfg.prose_prompt.clone(), cfg.words_prompt.clone(), cfg.prompt_buf.clone()),
-            _ => (cfg.prose_prompt.clone(), cfg.words_prompt.clone(), cfg.code_prompt.clone()),
+            Mode::Prose => (
+                cfg.prompt_buf.clone(),
+                cfg.words_prompt.clone(),
+                cfg.code_prompt.clone(),
+            ),
+            Mode::Words => (
+                cfg.prose_prompt.clone(),
+                cfg.prompt_buf.clone(),
+                cfg.code_prompt.clone(),
+            ),
+            Mode::Code => (
+                cfg.prose_prompt.clone(),
+                cfg.words_prompt.clone(),
+                cfg.prompt_buf.clone(),
+            ),
+            _ => (
+                cfg.prose_prompt.clone(),
+                cfg.words_prompt.clone(),
+                cfg.code_prompt.clone(),
+            ),
         };
         persisted_config.train.mode_cache = ModeCache {
             last_mode: Some(cfg.mode.name().to_string()),
