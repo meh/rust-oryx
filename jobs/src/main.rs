@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use std::future::pending;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use oryx_hid::{asynchronous::Event as KbdEvent, asynchronous::OryxKeyboard};
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
-use zbus::{connection, interface, object_server::SignalEmitter, zvariant::{OwnedValue, Value}};
+use tokio::sync::Notify;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use zbus::{
+    connection, interface,
+    object_server::SignalEmitter,
+    zvariant::{OwnedValue, Value},
+};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -82,6 +88,13 @@ struct StageColors {
 }
 
 #[derive(Deserialize, Default, Clone)]
+struct PromptColors {
+    waiting: Option<Rgb>,
+    accept: Option<Rgb>,
+    reject: Option<Rgb>,
+}
+
+#[derive(Deserialize, Default, Clone)]
 struct Colors {
     idle: Option<Rgb>,
     started: Option<Rgb>,
@@ -91,11 +104,15 @@ struct Colors {
     finished: FinishedColors,
     #[serde(default)]
     stage: StageColors,
+    #[serde(default)]
+    prompt: PromptColors,
 }
 
 #[derive(Deserialize, Default)]
 struct Config {
     slots: Vec<u8>,
+    /// Hold duration in ms to reject a prompt (default: 1000)
+    hold_ms: Option<u64>,
     #[serde(default)]
     colors: Colors,
 }
@@ -104,10 +121,16 @@ struct Config {
 
 #[derive(Clone, Debug)]
 enum JobState {
-    Created { metadata: HashMap<String, OwnedValue> },
+    Created {
+        metadata: HashMap<String, OwnedValue>,
+    },
     Started,
-    Progress { current: u32, total: u32 },
+    Progress {
+        current: u32,
+        total: u32,
+    },
     Stage(String),
+    Prompt(String),
     Finished(OwnedValue),
 }
 
@@ -127,6 +150,9 @@ struct JobManager {
     job_to_slot: HashMap<u32, usize>,
     key_to_slot: HashMap<(u8, u8), usize>,
     colors: Colors,
+    hold_ms: u64,
+    notify: Arc<Notify>,
+    prompt_responders: HashMap<u32, oneshot::Sender<bool>>,
 }
 
 impl JobManager {
@@ -153,11 +179,28 @@ impl JobManager {
             job_to_slot: HashMap::new(),
             key_to_slot,
             colors: config.colors.clone(),
+            hold_ms: config.hold_ms.unwrap_or(1000),
+            notify: Arc::new(Notify::new()),
+            prompt_responders: HashMap::new(),
         })
     }
 
-    fn alloc_slot(&mut self, metadata: HashMap<String, OwnedValue>) -> Option<(u32, u8)> {
-        let slot_i = self.slots.iter().position(|s| s.job_id.is_none())?;
+    fn alloc_slot(
+        &mut self,
+        metadata: HashMap<String, OwnedValue>,
+        preferred_slot: Option<usize>,
+    ) -> Option<(u32, u8)> {
+        let slot_i = if let Some(ps) = preferred_slot {
+            if ps >= self.slots.len() {
+                return None;
+            }
+            if self.slots[ps].job_id.is_some() {
+                return None;
+            }
+            ps
+        } else {
+            self.slots.iter().position(|s| s.job_id.is_none())?
+        };
         let id = self.next_job_id;
         self.next_job_id += 1;
         self.slots[slot_i].job_id = Some(id);
@@ -189,7 +232,27 @@ impl JobManager {
         self.slots[slot_i].state = None;
         self.job_to_slot.remove(&job_id);
         let led = self.slots[slot_i].led;
+        self.notify.notify_waiters();
         Some((job_id, led))
+    }
+
+    /// Check if a key position corresponds to a slot in Prompt state.
+    /// Returns (job_id, led_index) if so.
+    fn get_prompt_slot(&self, col: u8, row: u8) -> Option<(u32, u8)> {
+        let &slot_i = self.key_to_slot.get(&(col, row))?;
+        if !matches!(self.slots[slot_i].state, Some(JobState::Prompt(_))) {
+            return None;
+        }
+        let job_id = self.slots[slot_i].job_id?;
+        Some((job_id, self.slots[slot_i].led))
+    }
+
+    /// Resolve a prompt: take the oneshot sender and return it along with the accept/reject colors.
+    fn take_prompt_responder(
+        &mut self,
+        job_id: u32,
+    ) -> Option<oneshot::Sender<bool>> {
+        self.prompt_responders.remove(&job_id)
     }
 }
 
@@ -197,14 +260,14 @@ impl JobManager {
 
 fn match_finished_value(v: &OwnedValue, m: &FinishedMatchValue) -> bool {
     match (m, &**v) {
-        (FinishedMatchValue::Int(n), Value::I32(x))  => *x as i64 == *n,
-        (FinishedMatchValue::Int(n), Value::U32(x))  => *x as i64 == *n,
-        (FinishedMatchValue::Int(n), Value::I64(x))  => *x == *n,
-        (FinishedMatchValue::Int(n), Value::U64(x))  => *x as i64 == *n,
-        (FinishedMatchValue::Int(n), Value::I16(x))  => *x as i64 == *n,
-        (FinishedMatchValue::Int(n), Value::U16(x))  => *x as i64 == *n,
-        (FinishedMatchValue::Int(n), Value::U8(x))   => *x as i64 == *n,
-        (FinishedMatchValue::Str(s), Value::Str(x))  => x.as_str() == s,
+        (FinishedMatchValue::Int(n), Value::I32(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Int(n), Value::U32(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Int(n), Value::I64(x)) => *x == *n,
+        (FinishedMatchValue::Int(n), Value::U64(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Int(n), Value::I16(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Int(n), Value::U16(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Int(n), Value::U8(x)) => *x as i64 == *n,
+        (FinishedMatchValue::Str(s), Value::Str(x)) => x.as_str() == s,
         _ => false,
     }
 }
@@ -249,6 +312,10 @@ fn resolve_color(state: Option<&JobState>, colors: &Colors) -> (u8, u8, u8) {
             .map(|m| (m.color.0, m.color.1, m.color.2))
             .or_else(|| colors.stage.default.map(|c| (c.0, c.1, c.2)))
             .unwrap_or((255, 200, 0)),
+        Some(JobState::Prompt(_)) => {
+            let c = colors.prompt.waiting.unwrap_or(Rgb(200, 0, 255));
+            (c.0, c.1, c.2)
+        }
         Some(JobState::Finished(v)) => colors
             .finished
             .matches
@@ -277,12 +344,23 @@ fn state_to_signal(state: Option<&JobState>) -> (&'static str, HashMap<String, O
         ),
         Some(JobState::Stage(name)) => (
             "stage",
-            [("name".to_string(), OwnedValue::from(zbus::zvariant::Str::from(name.as_str())))].into(),
+            [(
+                "name".to_string(),
+                OwnedValue::from(zbus::zvariant::Str::from(name.as_str())),
+            )]
+            .into(),
         ),
-        Some(JobState::Finished(value)) => (
-            "finished",
-            [("value".to_string(), value.clone())].into(),
+        Some(JobState::Prompt(text)) => (
+            "prompt",
+            [(
+                "text".to_string(),
+                OwnedValue::from(zbus::zvariant::Str::from(text.as_str())),
+            )]
+            .into(),
         ),
+        Some(JobState::Finished(value)) => {
+            ("finished", [("value".to_string(), value.clone())].into())
+        }
     }
 }
 
@@ -290,6 +368,10 @@ fn state_to_signal(state: Option<&JobState>) -> (&'static str, HashMap<String, O
 
 enum KbdCmd {
     SetRgb { index: u8, r: u8, g: u8, b: u8 },
+    /// Start a breathing animation on the LED with the given color.
+    Breathe { index: u8, r: u8, g: u8, b: u8 },
+    /// Stop a breathing animation on the LED.
+    StopBreathe { index: u8 },
 }
 
 // ── DBus interface ────────────────────────────────────────────────────────────
@@ -305,16 +387,74 @@ impl Jobs {
     async fn create(
         &self,
         metadata: HashMap<String, OwnedValue>,
+        slot: i32,
+        timeout_ms: i32,
     ) -> zbus::fdo::Result<u32> {
-        let mut st = self.state.lock().await;
-        let (id, led) = st
-            .alloc_slot(metadata.clone())
-            .ok_or_else(|| zbus::fdo::Error::Failed("no free slots".into()))?;
-        let (r, g, b) = resolve_color(st.slots[*st.job_to_slot.get(&id).unwrap()].state.as_ref(), &st.colors);
-        drop(st);
-        let _ = self.cmd_tx.send(KbdCmd::SetRgb { index: led, r, g, b }).await;
-        let _ = self.status_tx.send((id, Some(JobState::Created { metadata }))).await;
-        Ok(id)
+        let timeout = if timeout_ms < 0 {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms as u64))
+        };
+        let slot = if slot < 0 { None } else { Some(slot as usize) };
+
+        loop {
+            let result = {
+                let mut st = self.state.lock().await;
+                let preferred = slot;
+                match st.alloc_slot(metadata.clone(), preferred) {
+                    Some((id, led)) => Ok((id, led)),
+                    None => {
+                        if let Some(ps) = preferred
+                            && ps >= st.slots.len()
+                        {
+                            return Err(zbus::fdo::Error::Failed(format!(
+                                "slot {ps} does not exist"
+                            )));
+                        }
+                        let notify = Arc::clone(&st.notify);
+                        drop(st);
+                        if let Some(dur) = timeout {
+                            let notified = notify.notified();
+                            tokio::select! {
+                                _ = notified => continue,
+                                _ = tokio::time::sleep(dur) => {
+                                    Err(if let Some(ps) = slot {
+                                        zbus::fdo::Error::Failed(format!("timeout waiting for slot {ps}"))
+                                    } else {
+                                        zbus::fdo::Error::Failed("timeout waiting for free slot".to_string())
+                                    })
+                                }
+                            }
+                        } else {
+                            notify.notified().await;
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let (id, led) = result?;
+            let st = self.state.lock().await;
+            let (r, g, b) = resolve_color(
+                st.slots[*st.job_to_slot.get(&id).unwrap()].state.as_ref(),
+                &st.colors,
+            );
+            drop(st);
+            let _ = self
+                .cmd_tx
+                .send(KbdCmd::SetRgb {
+                    index: led,
+                    r,
+                    g,
+                    b,
+                })
+                .await;
+            let _ = self
+                .status_tx
+                .send((id, Some(JobState::Created { metadata })))
+                .await;
+            return Ok(id);
+        }
     }
 
     async fn start(&self, job_id: u32) -> zbus::fdo::Result<()> {
@@ -322,7 +462,8 @@ impl Jobs {
     }
 
     async fn progress(&self, job_id: u32, current: u32, total: u32) -> zbus::fdo::Result<()> {
-        self.update(job_id, JobState::Progress { current, total }).await
+        self.update(job_id, JobState::Progress { current, total })
+            .await
     }
 
     async fn stage(&self, job_id: u32, name: String) -> zbus::fdo::Result<()> {
@@ -331,6 +472,46 @@ impl Jobs {
 
     async fn finish(&self, job_id: u32, value: OwnedValue) -> zbus::fdo::Result<()> {
         self.update(job_id, JobState::Finished(value)).await
+    }
+
+    /// Enter prompt state: LED breathes the prompt color until the user taps
+    /// (accept → true) or holds (reject → false) the slot key.
+    async fn prompt(&self, job_id: u32, text: String) -> zbus::fdo::Result<bool> {
+        let (tx, rx) = oneshot::channel();
+
+        let led = {
+            let mut st = self.state.lock().await;
+            let (led, (r, g, b)) = st
+                .set_state(job_id, JobState::Prompt(text.clone()))
+                .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
+            st.prompt_responders.insert(job_id, tx);
+            drop(st);
+
+            let _ = self
+                .cmd_tx
+                .send(KbdCmd::Breathe {
+                    index: led,
+                    r,
+                    g,
+                    b,
+                })
+                .await;
+            let _ = self
+                .status_tx
+                .send((job_id, Some(JobState::Prompt(text))))
+                .await;
+            led
+        };
+
+        // Block this DBus call until the user responds on the keyboard.
+        let accepted = rx.await.map_err(|_| {
+            zbus::fdo::Error::Failed("prompt cancelled (channel dropped)".to_string())
+        })?;
+
+        // Stop breathing (the keyboard_task will have started the pulse already).
+        let _ = self.cmd_tx.send(KbdCmd::StopBreathe { index: led }).await;
+
+        Ok(accepted)
     }
 
     async fn get_state(
@@ -361,11 +542,42 @@ impl Jobs {
             .set_state(job_id, state.clone())
             .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
         drop(st);
-        let _ = self.cmd_tx.send(KbdCmd::SetRgb { index: led, r, g, b }).await;
+        let _ = self
+            .cmd_tx
+            .send(KbdCmd::SetRgb {
+                index: led,
+                r,
+                g,
+                b,
+            })
+            .await;
         let _ = self.status_tx.send((job_id, Some(state))).await;
         Ok(())
     }
 }
+
+// ── Animation state ───────────────────────────────────────────────────────────
+
+struct BreatheState {
+    r: u8,
+    g: u8,
+    b: u8,
+    start: Instant,
+}
+
+struct PulseState {
+    r: u8,
+    g: u8,
+    b: u8,
+    start: Instant,
+    count: u8,
+    accepted: bool,
+    job_id: u32,
+    responder: Option<oneshot::Sender<bool>>,
+}
+
+const BREATHE_PERIOD_MS: f32 = 1500.0;
+const PULSE_CYCLE_MS: f32 = 166.0; // ~83ms on, ~83ms off
 
 // ── Keyboard task ─────────────────────────────────────────────────────────────
 
@@ -376,6 +588,13 @@ async fn keyboard_task(
     cmd_tx: mpsc::Sender<KbdCmd>,
     state: Arc<Mutex<JobManager>>,
 ) {
+    let mut breathing: HashMap<u8, BreatheState> = HashMap::new();
+    let mut pulsing: HashMap<u8, PulseState> = HashMap::new();
+    let mut keydown_times: HashMap<(u8, u8), Instant> = HashMap::new();
+
+    let mut anim_interval = tokio::time::interval(Duration::from_millis(30));
+    anim_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
@@ -383,13 +602,62 @@ async fn keyboard_task(
                     KbdCmd::SetRgb { index, r, g, b } => {
                         let _ = kbd.rgb(index, r, g, b).await;
                     }
+                    KbdCmd::Breathe { index, r, g, b } => {
+                        breathing.insert(index, BreatheState {
+                            r, g, b,
+                            start: Instant::now(),
+                        });
+                    }
+                    KbdCmd::StopBreathe { index } => {
+                        breathing.remove(&index);
+                    }
                 }
             }
             result = kbd.recv_event() => {
                 match result {
+                    Ok(KbdEvent::KeyDown { col, row }) => {
+                        let st = state.lock().await;
+                        if st.get_prompt_slot(col, row).is_some() {
+                            keydown_times.insert((col, row), Instant::now());
+                        }
+                        drop(st);
+                    }
                     Ok(KbdEvent::KeyUp { col, row }) => {
                         let mut st = state.lock().await;
-                        if let Some((job_id, led)) = st.try_clear(col, row) {
+
+                        // Check prompt slots first.
+                        if let Some((job_id, led)) = st.get_prompt_slot(col, row) {
+                            let hold_ms = st.hold_ms;
+                            let accept_color = st.colors.prompt.accept.unwrap_or(Rgb(0, 255, 0));
+                            let reject_color = st.colors.prompt.reject.unwrap_or(Rgb(255, 0, 0));
+
+                            let down_time = keydown_times.remove(&(col, row));
+                            let held_ms = down_time
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+                            let accepted = held_ms < hold_ms;
+
+                            let responder = st.take_prompt_responder(job_id);
+
+                            // Transition state back to Started (prompt is resolved).
+                            let slot_i = *st.job_to_slot.get(&job_id).unwrap();
+                            st.slots[slot_i].state = Some(JobState::Started);
+                            drop(st);
+
+                            // Stop breathing, start pulse.
+                            breathing.remove(&led);
+                            let pc = if accepted { accept_color } else { reject_color };
+                            pulsing.insert(led, PulseState {
+                                r: pc.0,
+                                g: pc.1,
+                                b: pc.2,
+                                start: Instant::now(),
+                                count: 3,
+                                accepted,
+                                job_id,
+                                responder,
+                            });
+                        } else if let Some((job_id, led)) = st.try_clear(col, row) {
                             drop(st);
                             let _ = status_tx.send((job_id, None)).await;
                             let _ = cmd_tx.send(KbdCmd::SetRgb { index: led, r: 0, g: 0, b: 0 }).await;
@@ -397,6 +665,52 @@ async fn keyboard_task(
                     }
                     Err(_) => break,
                     _ => {}
+                }
+            }
+            _ = anim_interval.tick() => {
+                let now = Instant::now();
+
+                // Update breathing LEDs.
+                for (&led, bs) in &breathing {
+                    let elapsed = now.duration_since(bs.start).as_millis() as f32;
+                    let phase = (elapsed / BREATHE_PERIOD_MS) * std::f32::consts::TAU;
+                    let brightness = 0.15 + 0.85 * ((phase.sin() + 1.0) / 2.0);
+                    let r = (bs.r as f32 * brightness).round() as u8;
+                    let g = (bs.g as f32 * brightness).round() as u8;
+                    let b = (bs.b as f32 * brightness).round() as u8;
+                    let _ = kbd.rgb(led, r, g, b).await;
+                }
+
+                // Update pulsing LEDs, removing finished ones.
+                let mut done = Vec::new();
+                for (&led, ps) in &pulsing {
+                    let elapsed = now.duration_since(ps.start).as_millis() as f32;
+                    let total_ms = ps.count as f32 * PULSE_CYCLE_MS;
+                    if elapsed >= total_ms {
+                        done.push(led);
+                        continue;
+                    }
+                    let phase = (elapsed / PULSE_CYCLE_MS) * std::f32::consts::TAU;
+                    let brightness = ((phase.sin() + 1.0) / 2.0).powi(2);
+                    let r = (ps.r as f32 * brightness).round() as u8;
+                    let g = (ps.g as f32 * brightness).round() as u8;
+                    let b = (ps.b as f32 * brightness).round() as u8;
+                    let _ = kbd.rgb(led, r, g, b).await;
+                }
+
+                for led in done {
+                    if let Some(mut ps) = pulsing.remove(&led) {
+                        // Turn off the LED after pulse.
+                        let _ = kbd.rgb(led, 0, 0, 0).await;
+
+                        // Send response and emit state signal.
+                        if let Some(responder) = ps.responder.take() {
+                            let _ = responder.send(ps.accepted);
+                        }
+                        let _ = status_tx
+                            .send((ps.job_id, Some(JobState::Started)))
+                            .await;
+                    }
                 }
             }
         }
@@ -419,7 +733,10 @@ async fn main() -> Result<()> {
     let mut config: Config = match std::fs::read_to_string(&config_path) {
         Ok(s) => toml::from_str(&s).context("parsing config")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(e) => return Err(e).with_context(|| format!("reading config from {}", config_path.display())),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading config from {}", config_path.display()));
+        }
     };
 
     if !cli.slot.is_empty() {
@@ -448,7 +765,11 @@ async fn main() -> Result<()> {
         state.clone(),
     ));
 
-    let jobs = Jobs { state, cmd_tx, status_tx };
+    let jobs = Jobs {
+        state,
+        cmd_tx,
+        status_tx,
+    };
 
     let conn = connection::Builder::session()
         .context("creating session bus")?

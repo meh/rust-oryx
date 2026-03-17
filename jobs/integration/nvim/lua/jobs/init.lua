@@ -129,6 +129,51 @@ function Job:get_state()
     return { state = state_str, metadata = strip_meta(raw_meta) }
 end
 
+--- Enter prompt state: the slot LED breathes until the user taps (accept) or
+--- holds (reject) the key. This call blocks until the user responds, so it
+--- must be run from a thread (vim.uv.new_thread or coroutine that yields).
+--- @param text string  prompt text (stored as metadata, visible via signals)
+--- @return boolean  true if the user accepted (tap), false if rejected (hold)
+function Job:prompt_sync(text)
+    local p = get_proxy()
+    if not p then return false end
+    return p:Prompt(self.id, text)
+end
+
+--- Async version of prompt: spawns a thread so Neovim's event loop is not
+--- blocked, then calls `callback(accepted)` on the main thread.
+--- @param text string
+--- @param callback fun(accepted: boolean)
+function Job:prompt(text, callback)
+    local job_id = self.id
+    -- Use vim.system with dbus-send as a simple async mechanism, but actually
+    -- the cleaner approach is to use GLib async iteration: the proxy call will
+    -- complete during a future GLib main context iteration pumped by our timer.
+    -- However, dbus_proxy calls are synchronous and would block.
+    -- So we use a Lua coroutine + vim.uv.new_work for true async.
+    local work = vim.uv.new_work(
+        -- Work function runs in a separate Lua state (thread).
+        function(id, prompt_text)
+            local dp = require("dbus_proxy")
+            local p = dp.Proxy:new({
+                bus       = dp.Bus.SESSION,
+                name      = "zsa.oryx.Jobs",
+                interface = "zsa.oryx.Jobs",
+                path      = "/zsa/oryx/Jobs",
+            })
+            if not p then return false end
+            return p:Prompt(id, prompt_text)
+        end,
+        -- After function runs on the main thread.
+        function(accepted)
+            vim.schedule(function()
+                callback(accepted)
+            end)
+        end
+    )
+    work:queue(job_id, text)
+end
+
 -- ── Public API ────────────────────────────────────────────────────────────────
 
 local M = {}
@@ -139,7 +184,7 @@ local M = {}
 function M.create(metadata)
     local p = get_proxy()
     if not p then return nil end
-    local id = p:Create(to_asv(metadata))
+    local id = p:Create(to_asv(metadata), -1, -1)
     return setmetatable({ id = id }, Job)
 end
 
