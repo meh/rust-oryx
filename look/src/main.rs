@@ -291,27 +291,8 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
     }
 }
 
-// ── Matrix → key index ────────────────────────────────────────────────────────
-//
-// Best-guess mapping for Moonlander MK1. Rows 0-5 = left half, 6-11 = right half.
-// Row 3: 6 keys (col 6 = missing/tower key on left, col 0 missing on right).
-// Row 4: 5 keys. Row 5/11: thumb cluster (4 keys).
-// Adjust if keys don't match physical positions.
-
 fn matrix_to_index(row: u8, col: u8) -> Option<usize> {
-    match (row, col) {
-        (r @ 0..=2, c @ 0..=6) => Some(r as usize * 7 + c as usize),
-        (3, c @ 0..=5) => Some(21 + c as usize),
-        (4, c @ 0..=4) => Some(27 + c as usize),
-        (5, c @ 0..=2) => Some(33 + c as usize), // left thumb: col0=outer, col1=mid, col2=inner
-        (5, 3) => Some(32),                      // left thumb: col3=wide key
-        (r @ 6..=8, c @ 0..=6) => Some(36 + (r as usize - 6) * 7 + c as usize),
-        (9, c @ 1..=6) => Some(56 + c as usize), // right 1×6: col0 missing (tower), col1-6 → 57-62
-        (10, c @ 2..=6) => Some(61 + c as usize), // right 1×5: col0-1 missing, col2-6 → 63-67
-        (11, 3) => Some(68),                     // right thumb: col3=wide key (inner)
-        (11, c @ 4..=6) => Some(65 + c as usize), // right thumb: col4-6=small → 69,70,71
-        _ => None,
-    }
+    oryx_hid::matrix::pos_to_led(col, row).map(|i| i as usize)
 }
 
 // ── Keyboard layout rendering ─────────────────────────────────────────────────

@@ -8,7 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 oryx-hid = { path = "../hid" }
 ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 futures-lite = "2"
 dirs = "5"
