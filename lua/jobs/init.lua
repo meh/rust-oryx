@@ -5,13 +5,21 @@
 --
 -- Add the parent directory to runtimepath, then:
 --   local jobs = require("jobs")
---   local job = jobs.create({ name = "build", source = "terminal" })
+--   local a    = require("plenary.async")
+--   local job  = jobs.create({ name = "build", source = "terminal" })
 --   job:start()
 --   job:progress(50, 100)
 --   job:finish()
+--
+-- For the blocking prompt, use inside an async function:
+--   a.void(function()
+--     local accepted = job:prompt("allow this?")
+--     ...
+--   end)()
 
+local a          = require("plenary.async")
 local dbus_proxy = require("dbus_proxy")
-local GLib = require("lgi").GLib
+local GLib       = require("lgi").GLib
 
 -- ── internals ─────────────────────────────────────────────────────────────────
 
@@ -40,21 +48,27 @@ local function get_proxy()
     return _proxy
 end
 
--- Build a GLib.Variant of type a{sv} from a flat Lua table.
+-- Build a plain Lua table of GLib.Variant values from a flat Lua table.
+-- dbus_proxy reads the `a{sv}` signature from DBus introspection and passes
+-- this table to lgi's variant builder, which calls Variant.new_variant() on
+-- each value — so each value must be a GLib.Variant, but the outer a{sv}
+-- wrapper must NOT be pre-built (that would cause double-encoding).
 -- Supported value types: string, number (integer or float), boolean.
-local function to_asv(t)
+-- Note: math.type() is Lua 5.3+; LuaJIT (Neovim) is 5.1-based, so floats
+-- are detected via v ~= math.floor(v) instead.
+local function make_metadata(t)
     local entries = {}
     for k, v in pairs(t or {}) do
         local tv = type(v)
         if tv == "string" then
             entries[k] = GLib.Variant("s", v)
         elseif tv == "number" then
-            entries[k] = GLib.Variant(math.type(v) == "float" and "d" or "i", v)
+            entries[k] = GLib.Variant(v ~= math.floor(v) and "d" or "i", v)
         elseif tv == "boolean" then
             entries[k] = GLib.Variant("b", v)
         end
     end
-    return GLib.Variant("a{sv}", entries)
+    return entries
 end
 
 -- Unwrap a GLib a{sv} variant into a plain Lua table.
@@ -107,11 +121,13 @@ function Job:stage(name)
     get_proxy():Stage(self.id, name)
 end
 
-function Job:finish(value)
+--- @param value string|number|boolean|nil  finish value matched against config colors
+--- @param timeout_ms integer?  ms after which the slot auto-clears; -1 (default) waits for key press
+function Job:finish(value, timeout_ms)
     local tv = type(value)
     local v
     if tv == "number" then
-        v = GLib.Variant(math.type(value) == "float" and "d" or "i", value)
+        v = GLib.Variant(value ~= math.floor(value) and "d" or "i", value)
     elseif tv == "string" then
         v = GLib.Variant("s", value)
     elseif tv == "boolean" then
@@ -119,7 +135,7 @@ function Job:finish(value)
     else
         v = GLib.Variant("b", true)
     end
-    get_proxy():Finish(self.id, v)
+    get_proxy():Finish(self.id, v, timeout_ms or -1)
 end
 
 function Job:get_state()
@@ -130,29 +146,17 @@ function Job:get_state()
 end
 
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or
---- holds (reject) the key. This call blocks until the user responds, so it
---- must be run from a thread (vim.uv.new_thread or coroutine that yields).
+--- holds (reject) the key. Async — call from within a plenary.async context
+--- (a.void / a.run) and the result is returned directly (no callback needed).
 --- @param text string  prompt text (stored as metadata, visible via signals)
 --- @return boolean  true if the user accepted (tap), false if rejected (hold)
-function Job:prompt_sync(text)
-    local p = get_proxy()
-    if not p then return false end
-    return p:Prompt(self.id, text)
-end
-
---- Async version of prompt: spawns a thread so Neovim's event loop is not
---- blocked, then calls `callback(accepted)` on the main thread.
---- @param text string
---- @param callback fun(accepted: boolean)
-function Job:prompt(text, callback)
+Job.prompt = a.wrap(function(self, text, callback)
     local job_id = self.id
-    -- Use vim.system with dbus-send as a simple async mechanism, but actually
-    -- the cleaner approach is to use GLib async iteration: the proxy call will
-    -- complete during a future GLib main context iteration pumped by our timer.
-    -- However, dbus_proxy calls are synchronous and would block.
-    -- So we use a Lua coroutine + vim.uv.new_work for true async.
+    -- The DBus Prompt call blocks until the user responds on the keyboard.
+    -- Offload it to a libuv thread-pool worker so Neovim's event loop is
+    -- not blocked; resume the calling coroutine via the after-function.
     local work = vim.uv.new_work(
-        -- Work function runs in a separate Lua state (thread).
+        -- Runs in a separate Lua state (no shared upvalues).
         function(id, prompt_text)
             local dp = require("dbus_proxy")
             local p = dp.Proxy:new({
@@ -164,7 +168,7 @@ function Job:prompt(text, callback)
             if not p then return false end
             return p:Prompt(id, prompt_text)
         end,
-        -- After function runs on the main thread.
+        -- After-function runs on the main thread; resume the coroutine.
         function(accepted)
             vim.schedule(function()
                 callback(accepted)
@@ -172,7 +176,7 @@ function Job:prompt(text, callback)
         end
     )
     work:queue(job_id, text)
-end
+end, 3)
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
@@ -184,7 +188,7 @@ local M = {}
 function M.create(metadata)
     local p = get_proxy()
     if not p then return nil end
-    local id = p:Create(to_asv(metadata), -1, -1)
+    local id = p:Create(make_metadata(metadata), -1, -1)
     return setmetatable({ id = id }, Job)
 end
 
