@@ -147,11 +147,27 @@ end
 
 --- Resolve a pending prompt externally without keyboard input.
 --- Safe to call even if the prompt was already resolved by the keyboard (no-op).
+--- Fire-and-forget: offloaded to a thread-pool worker so the Neovim main
+--- thread is never blocked by the DBus round-trip.
 --- @param accepted boolean  true to accept, false to reject
 function Job:resolve_prompt(accepted)
-    local p = get_proxy()
-    if not p then return end
-    p:PromptResolve(self.id, accepted == true)
+    local job_id  = self.id
+    local answer  = accepted == true
+    local work = vim.uv.new_work(
+        function(id, acc)
+            local dp = require("dbus_proxy")
+            local p = dp.Proxy:new({
+                bus       = dp.Bus.SESSION,
+                name      = "zsa.oryx.Jobs",
+                interface = "zsa.oryx.Jobs",
+                path      = "/zsa/oryx/Jobs",
+            })
+            if not p then return end
+            p:PromptResolve(id, acc)
+        end,
+        function() end  -- no return value needed
+    )
+    work:queue(job_id, answer)
 end
 
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or

@@ -93,7 +93,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-
     assertions = [
       {
         assertion = config.hardware.keyboard.zsa.enable;
