@@ -31,7 +31,17 @@
           craneLib = (crane.mkLib final).overrideToolchain (final.rust-bin.stable.latest.default);
 
           commonArgs = {
-            src = craneLib.cleanCargoSource (craneLib.path ./.);
+            src =
+              let
+                # cleanCargoSource strips non-Rust files; extend it to also keep
+                # any `assets/` directories (e.g. train/assets/*.bdf).
+                isAsset = path: _type: builtins.match ".*/assets/.*" path != null;
+                isCargoOrAsset = path: type: (craneLib.filterCargoSources path type) || (isAsset path type);
+              in
+              final.lib.cleanSourceWith {
+                src = craneLib.path ./.;
+                filter = isCargoOrAsset;
+              };
             # Crane can't infer a name from a workspace Cargo.toml (no [package]
             # section), so we provide one explicitly to silence the warning.
             pname = "oryx";
