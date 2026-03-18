@@ -11,7 +11,7 @@
 ///
 /// Takes (col, row) where row is 0-4 for main block, 0-6 for thumb row.
 /// Returns LED index using column-major formula (col * 5 + row).
-pub fn key_to_led(col: u8, row: u8) -> Option<u8> {
+pub fn pos_to_led(col: u8, row: u8) -> Option<u8> {
     let idx = match (row, col) {
         // Left half: 5×7 main block (5 rows, 7 cols), column-major (col * 5 + row)
         (r @ 0..=4, c @ 0..=6) => c as usize * 5 + r as usize,
@@ -29,7 +29,7 @@ pub fn key_to_led(col: u8, row: u8) -> Option<u8> {
 }
 
 /// Convert an RGB LED index to its key matrix position `(col, row)`.
-pub fn led_to_key(led: u8) -> Option<(u8, u8)> {
+pub fn led_to_pos(led: u8) -> Option<(u8, u8)> {
     let idx = led as usize;
 
     if idx > 71 {
@@ -73,7 +73,7 @@ pub fn led_to_key(led: u8) -> Option<(u8, u8)> {
 /// This is used for the oryx-look visual layout which matches the physical keyboard.
 /// Takes (col, row) where row is 0-6 for main block, col is 0-6.
 /// Returns key index using row-major formula (row * 7 + col).
-pub fn pos_to_led(col: u8, row: u8) -> Option<u8> {
+pub fn pos_to_key(col: u8, row: u8) -> Option<u8> {
     let idx = match (row, col) {
         // Left half: 3×7 main block
         (r @ 0..=2, c @ 0..=6) => r as usize * 7 + c as usize,
@@ -99,7 +99,7 @@ pub fn pos_to_led(col: u8, row: u8) -> Option<u8> {
 }
 
 /// Convert a row-major key index to its key matrix position `(col, row)`.
-pub fn led_to_pos(led: u8) -> Option<(u8, u8)> {
+pub fn key_to_pos(led: u8) -> Option<(u8, u8)> {
     let idx = led as usize;
 
     if idx > 71 {
@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn roundtrip_all_leds() {
         for led in 0u8..72 {
-            let pos = led_to_pos(led).unwrap_or_else(|| panic!("led {led} has no position"));
-            let back = pos_to_led(pos.0, pos.1).expect("pos should map back");
+            let pos = key_to_pos(led).unwrap_or_else(|| panic!("led {led} has no position"));
+            let back = pos_to_key(pos.0, pos.1).expect("pos should map back");
             assert_eq!(back, led, "led {led} roundtrip failed");
         }
     }
@@ -170,8 +170,8 @@ mod tests {
     #[test]
     fn roundtrip_all_keys() {
         for led in 0u8..72 {
-            let pos = led_to_key(led).unwrap_or_else(|| panic!("led {led} has no position"));
-            let back = key_to_led(pos.0, pos.1).expect("pos should map back");
+            let pos = led_to_pos(led).unwrap_or_else(|| panic!("led {led} has no position"));
+            let back = pos_to_led(pos.0, pos.1).expect("pos should map back");
             assert_eq!(back, led, "key {led} roundtrip failed");
         }
     }
@@ -180,7 +180,7 @@ mod tests {
     fn no_duplicate_positions() {
         let mut seen = std::collections::HashSet::new();
         for led in 0u8..72 {
-            if let Some(pos) = led_to_pos(led) {
+            if let Some(pos) = key_to_pos(led) {
                 assert!(seen.insert(pos), "duplicate position {pos:?} for led {led}");
             }
         }
@@ -190,7 +190,7 @@ mod tests {
     fn no_duplicate_keys() {
         let mut seen = std::collections::HashSet::new();
         for led in 0u8..72 {
-            if let Some(pos) = led_to_key(led) {
+            if let Some(pos) = led_to_pos(led) {
                 assert!(
                     seen.insert(pos),
                     "duplicate key position {pos:?} for led {led}"
@@ -201,12 +201,12 @@ mod tests {
 
     #[test]
     fn out_of_range_returns_none() {
-        assert!(led_to_pos(72).is_none());
-        assert!(led_to_pos(255).is_none());
+        assert!(key_to_pos(72).is_none());
+        assert!(key_to_pos(255).is_none());
     }
 
     #[test]
     fn matches_physical_keybaord() {
-        assert_eq!(led_to_pos(5), Some((5, 0)));
+        assert_eq!(key_to_pos(5), Some((5, 0)));
     }
 }

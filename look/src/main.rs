@@ -292,7 +292,7 @@ fn key_style(key: &layout::Key, base_key: Option<&layout::Key>, pressed: bool) -
 }
 
 fn matrix_to_index(row: u8, col: u8) -> Option<usize> {
-    oryx_hid::matrix::pos_to_led(col, row).map(|i| i as usize)
+    oryx_hid::matrix::pos_to_key(col, row).map(|i| i as usize)
 }
 
 fn led_index_from_row_major(key_index: usize) -> Option<usize> {
@@ -300,7 +300,7 @@ fn led_index_from_row_major(key_index: usize) -> Option<usize> {
     // Key index = row * 7 + col
     // LED index = col * 5 + row (left half) or 36 + col * 5 + (row - 6) (right half)
     // For thumb rows (5, 11): direct mapping (32-35 left, 68-71 right)
-    
+
     if key_index <= 20 {
         // Left main block (row 0-2, all 7 cols)
         let row = key_index / 7;
@@ -325,7 +325,7 @@ fn led_index_from_row_major(key_index: usize) -> Option<usize> {
     } else if key_index <= 35 {
         // Left thumb cluster: direct mapping
         Some(key_index)
-      } else if key_index <= 56 {
+    } else if key_index <= 56 {
         // Right main block (row 6-8, all 7 cols)
         let idx = key_index - 36;
         let row = idx / 7;
