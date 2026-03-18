@@ -6,7 +6,7 @@
 /// The Moonlander has two different indexing schemes:
 /// - Key matrix: 5 rows × 7 columns (rows 0-4, cols 0-6 for main block), row-major
 /// - LED matrix: 7 rows × 5 columns, column-major indexing (col * 5 + row)
-
+///
 /// Convert a key matrix position to its RGB LED index.
 ///
 /// Takes (col, row) where row is 0-4 for main block, 0-6 for thumb row.
