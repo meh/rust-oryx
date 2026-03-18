@@ -240,7 +240,10 @@ impl JobManager {
         let mut key_to_slot = HashMap::new();
 
         for (i, &led) in config.slots.iter().enumerate() {
-            let (col, row) = oryx_hid::matrix::led_to_key(led)
+            // Firmware KeyDown/KeyUp events use the row-major scheme (led_to_pos),
+            // not the column-major LED scheme (led_to_key). Use led_to_pos so
+            // key_to_slot matches what recv_event() actually delivers.
+            let (col, row) = oryx_hid::matrix::led_to_pos(led)
                 .with_context(|| format!("LED index {led} has no known matrix position"))?;
             key_to_slot.insert((col, row), i);
             slots.push(Slot {
