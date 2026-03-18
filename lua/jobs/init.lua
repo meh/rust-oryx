@@ -151,8 +151,9 @@ end
 --- thread is never blocked by the DBus round-trip.
 --- @param accepted boolean  true to accept, false to reject
 function Job:resolve_prompt(accepted)
-    local job_id  = self.id
-    local answer  = accepted == true
+    local job_id = self.id
+    -- vim.uv work threads only support string/number arguments, not booleans.
+    local answer = accepted == true and 1 or 0
     local work = vim.uv.new_work(
         function(id, acc)
             local dp = require("dbus_proxy")
@@ -163,9 +164,9 @@ function Job:resolve_prompt(accepted)
                 path      = "/zsa/oryx/Jobs",
             })
             if not p then return end
-            p:PromptResolve(id, acc)
+            p:PromptResolve(id, acc == 1)
         end,
-        function() end  -- no return value needed
+        function() end  -- fire-and-forget, no return value needed
     )
     work:queue(job_id, answer)
 end
@@ -180,6 +181,8 @@ Job.prompt = a.wrap(function(self, text, callback)
     -- The DBus Prompt call blocks until the user responds on the keyboard.
     -- Offload it to a libuv thread-pool worker so Neovim's event loop is
     -- not blocked; resume the calling coroutine via the after-function.
+    -- vim.uv work threads only support string/number across the boundary.
+    -- Return 1/0 from the worker and convert back to boolean in the after-fn.
     local work = vim.uv.new_work(
         -- Runs in a separate Lua state (no shared upvalues).
         function(id, prompt_text)
@@ -190,13 +193,13 @@ Job.prompt = a.wrap(function(self, text, callback)
                 interface = "zsa.oryx.Jobs",
                 path      = "/zsa/oryx/Jobs",
             })
-            if not p then return false end
-            return p:Prompt(id, prompt_text)
+            if not p then return 0 end
+            return p:Prompt(id, prompt_text) and 1 or 0
         end,
         -- After-function runs on the main thread; resume the coroutine.
-        function(accepted)
+        function(accepted_int)
             vim.schedule(function()
-                callback(accepted)
+                callback(accepted_int == 1)
             end)
         end
     )
