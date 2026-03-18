@@ -41,6 +41,7 @@ end
 -- ── internals ─────────────────────────────────────────────────────────────────
 
 --- Get or create a job for the given session, starting it immediately.
+--- Must be called from within an a.void / a.run coroutine context.
 --- @param session_id string
 --- @return table? job
 local function get_or_create(session_id)
@@ -59,6 +60,7 @@ local function get_or_create(session_id)
 end
 
 --- Finish and clean up the active entry for a session.
+--- Must be called from within an a.void / a.run coroutine context.
 --- @param session_id string
 --- @param value integer  0 = ok, 1 = error
 --- @param timeout_ms integer  ms before auto-clear
@@ -203,14 +205,14 @@ function M.setup()
                 end
 
                 -- If the keyboard hasn't resolved yet, unblock it (no-op if it already did).
-                entry.job:resolve_prompt(accepted)
+                entry.job:prompt_resolve(accepted)
             end
 
             entry.pending_permission = resolve_once
 
             log("session " .. sid_short(sid) .. ': prompt "' .. title .. '" — awaiting keyboard or UI')
 
-            -- Kick off the blocking keyboard prompt in the background.
+            -- Kick off the keyboard prompt in the background.
             -- When the keyboard responds it calls resolve_once; if the UI
             -- responded first, resolve_once is already a no-op.
             a.void(function()
@@ -235,7 +237,7 @@ function M.setup()
             local entry = active[sid]
             if not entry or not entry.pending_permission then return end
 
-            local response = props.response or "reject"
+            local response = props.reply or "reject"
             local accepted = response ~= "reject"
             log("session " .. sid_short(sid) .. ": permission.replied (" .. response .. ")")
             entry.pending_permission(accepted)
@@ -249,7 +251,7 @@ function M.teardown()
         augroup = nil
     end
     for _, entry in pairs(active) do
-        pcall(function() entry.job:finish(0, 0) end) -- immediate clear on teardown
+        a.void(function() entry.job:finish(0, 0) end)() -- fire-and-forget immediate clear
     end
     active = {}
 end
