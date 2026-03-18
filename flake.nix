@@ -32,6 +32,10 @@
 
           commonArgs = {
             src = craneLib.cleanCargoSource (craneLib.path ./.);
+            # Crane can't infer a name from a workspace Cargo.toml (no [package]
+            # section), so we provide one explicitly to silence the warning.
+            pname = "oryx";
+            version = "0.1.0";
             strictDeps = true;
             nativeBuildInputs = [ final.pkg-config ];
             buildInputs = [
