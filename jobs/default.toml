@@ -1,0 +1,82 @@
+slots = [0, 1, 2]
+
+# How long a key must be held (ms) to reject a prompt instead of accepting it.
+hold_ms = 1000
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+#
+# Every color field accepts either:
+#   - a static hex color:  "#RRGGBB"
+#   - an animation table:
+#       { animation = "breathe", color = "#RRGGBB" }
+#       { animation = "breathe", color = "#RRGGBB", period_ms = 1500 }
+#       { animation = "breathe", colors = ["#RRGGBB", "#RRGGBB"], period_ms = 1500 }
+#       { animation = "bounce",  colors = ["#RRGGBB", "#RRGGBB", "#RRGGBB"] }
+#
+# Animations:
+#   breathe  Brightness oscillates with a sine wave (min 15 %, max 100 %).
+#            With multiple colors the hue also shifts through the gradient in
+#            sync with the brightness.  Default period: 1500 ms.
+#   bounce   Color position sweeps back and forth through the gradient at full
+#            brightness (triangle wave).  Default period: 2000 ms.
+#
+# The `colors` key takes priority over `color` when both are present.
+# Omit a field to use the hardcoded default shown in the comments below.
+
+[colors]
+# Slot is idle / job just created.  Default: "#000000" (off).
+idle = "#000000"
+
+# Job has been started.  Default: "#0064FF".
+started = "#0064FF"
+
+# ── Progress ─────────────────────────────────────────────────────────────────
+# The LED color is linearly interpolated between `start` (0 %) and `end`
+# (100 %) as the job advances.  These two fields are always static colors
+# (they are lerp endpoints, not independent specs).
+[colors.progress]
+start = "#0064FF"
+end   = "#00FF64"
+
+# ── Finished ─────────────────────────────────────────────────────────────────
+# Shown after the job finishes.  The slot stays lit until the user taps the
+# key (or until `timeout_ms` elapses if one was passed to Finish()).
+[colors.finished]
+# Fallback when no match below applies.  Default: "#B4B4B4".
+default = "#B4B4B4"
+
+# Per-value overrides: `value` is matched against the variant passed to
+# Finish().  Integers and strings are both supported.
+[[colors.finished.matches]]
+value = 0
+color = "#00FF00"   # exit-code 0 → green
+
+[[colors.finished.matches]]
+value = 1
+color = "#FF0000"   # exit-code 1 → red
+
+# ── Stage ─────────────────────────────────────────────────────────────────────
+# Shown while the job is in a named stage (e.g. a build step).
+[colors.stage]
+# Fallback when no named match applies.  Default: "#FFC800".
+default = "#FFC800"
+
+# Per-name overrides.
+[[colors.stage.matches]]
+name  = "compiling"
+color = "#FF8000"
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+# The slot enters prompt state when the job calls Prompt().  The LED animates
+# until the user taps (accept) or holds (reject) the key, or until
+# PromptResolve() is called from software.
+[colors.prompt]
+# Animation while waiting for a response.
+# Default: breathe at "#C800FF".
+waiting = { animation = "breathe", color = "#C800FF", period_ms = 1500 }
+
+# Flash color after an accept (tap).  Static only.  Default: "#00FF00".
+accept = "#00FF00"
+
+# Flash color after a reject (hold).  Static only.  Default: "#FF0000".
+reject = "#FF0000"

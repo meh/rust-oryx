@@ -145,6 +145,15 @@ function Job:get_state()
     return { state = state_str, metadata = strip_meta(raw_meta) }
 end
 
+--- Resolve a pending prompt externally without keyboard input.
+--- Safe to call even if the prompt was already resolved by the keyboard (no-op).
+--- @param accepted boolean  true to accept, false to reject
+function Job:resolve_prompt(accepted)
+    local p = get_proxy()
+    if not p then return end
+    p:PromptResolve(self.id, accepted == true)
+end
+
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or
 --- holds (reject) the key. Async — call from within a plenary.async context
 --- (a.void / a.run) and the result is returned directly (no callback needed).
