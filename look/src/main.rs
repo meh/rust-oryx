@@ -295,6 +295,58 @@ fn matrix_to_index(row: u8, col: u8) -> Option<usize> {
     oryx_hid::matrix::pos_to_led(col, row).map(|i| i as usize)
 }
 
+fn led_index_from_row_major(key_index: usize) -> Option<usize> {
+    // Convert row-major key index to column-major LED index
+    // Key index = row * 7 + col
+    // LED index = col * 5 + row (left half) or 36 + col * 5 + (row - 6) (right half)
+    // For thumb rows (5, 11): direct mapping (32-35 left, 68-71 right)
+    
+    if key_index <= 20 {
+        // Left main block (row 0-2, all 7 cols)
+        let row = key_index / 7;
+        let col = key_index % 7;
+        if row <= 4 {
+            Some(col * 5 + row)
+        } else {
+            Some(key_index)
+        }
+    } else if key_index <= 26 {
+        // Left row 3 (6 keys, cols 0-5)
+        let col = key_index - 21;
+        if col <= 4 {
+            Some(col * 5 + 3)
+        } else {
+            Some(key_index)
+        }
+    } else if key_index <= 31 {
+        // Left row 4 (5 keys, cols 0-4)
+        let col = key_index - 27;
+        Some(col * 5 + 4)
+    } else if key_index <= 35 {
+        // Left thumb cluster: direct mapping
+        Some(key_index)
+      } else if key_index <= 56 {
+        // Right main block (row 6-8, all 7 cols)
+        let idx = key_index - 36;
+        let row = idx / 7;
+        let col = idx % 7;
+        Some(36 + col * 5 + row)
+    } else if key_index <= 62 {
+        // Right row 9 (6 keys, cols 1-6)
+        let col = key_index - 57 + 1;
+        Some(36 + (col - 1) * 5 + 3)
+    } else if key_index <= 67 {
+        // Right row 10 (5 keys, cols 2-6)
+        let col = key_index - 63 + 2;
+        Some(36 + col * 5 + 4)
+    } else if key_index <= 71 {
+        // Right thumb cluster: direct mapping
+        Some(key_index)
+    } else {
+        None
+    }
+}
+
 // ── Keyboard layout rendering ─────────────────────────────────────────────────
 //
 // Moonlander key indices (72 total per side, 36 per half):
@@ -340,8 +392,9 @@ fn content_line(
     let mut spans = vec![Span::raw("│")];
     for &i in indices {
         let (label, style) = if long_held.contains(&i) {
+            let led_idx = led_index_from_row_major(i).unwrap_or(i);
             (
-                format!("{:^4}", i),
+                format!("{:^4}", led_idx),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -486,8 +539,9 @@ fn render_keyboard(
         let wl_bk = base_keys.and_then(|bks| bks.get(wl));
         let wr_bk = base_keys.and_then(|bks| bks.get(wr));
         let (l_label, l_style) = if long_held.contains(&wl) {
+            let led_idx = led_index_from_row_major(wl).unwrap_or(wl);
             (
-                format!("{:^9}", wl),
+                format!("{:^9}", led_idx),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -499,8 +553,9 @@ fn render_keyboard(
             )
         };
         let (r_label, r_style) = if long_held.contains(&wr) {
+            let led_idx = led_index_from_row_major(wr).unwrap_or(wr);
             (
-                format!("{:^9}", wr),
+                format!("{:^9}", led_idx),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
