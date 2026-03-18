@@ -48,13 +48,19 @@ local function get_or_create(session_id)
     local entry = active[session_id]
     if entry then return entry.job end
 
+    -- Reserve the slot immediately before yielding to jobs.create, so that a
+    -- second busy event arriving while CreateAsync is in flight sees the
+    -- sentinel and bails rather than creating a second job.
+    active[session_id] = { job = nil, tool_count = 0 }
+
     local job = jobs.create({ name = "opencode", session_id = session_id })
     if not job then
+        active[session_id] = nil
         warn("session " .. sid_short(session_id) .. ": failed to create job (service unavailable?)")
         return nil
     end
     job:start()
-    active[session_id] = { job = job, tool_count = 0 }
+    active[session_id].job = job
     log("session " .. sid_short(session_id) .. ": job " .. tostring(job.id) .. " created")
     return job
 end
@@ -67,7 +73,7 @@ end
 --- @param reason string  log label
 local function finish_session(session_id, value, timeout_ms, reason)
     local entry = active[session_id]
-    if not entry then return end
+    if not entry or not entry.job then return end
     if value == 0 then
         log("session " .. sid_short(session_id) .. ": " .. reason)
     else
@@ -117,7 +123,7 @@ function M.setup()
             local sid = part.sessionID
             if not sid then return end
             local entry = active[sid]
-            if not entry then return end
+            if not entry or not entry.job then return end
 
             local tool_name = (part.tool and part.tool.name) or part.name or "tool"
 
@@ -180,7 +186,7 @@ function M.setup()
             local sid = props.sessionID
             if not sid then return end
             local entry = active[sid]
-            if not entry then return end
+            if not entry or not entry.job then return end
 
             local title = props.title or "permission"
 
@@ -205,7 +211,7 @@ function M.setup()
                 end
 
                 -- If the keyboard hasn't resolved yet, unblock it (no-op if it already did).
-                entry.job:prompt_resolve(accepted)
+                a.void(function() entry.job:prompt_resolve(accepted) end)()
             end
 
             entry.pending_permission = resolve_once
