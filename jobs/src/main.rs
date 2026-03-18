@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::future::pending;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -187,7 +186,7 @@ struct Config {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum JobState {
     Created {
         metadata: HashMap<String, OwnedValue>,
@@ -298,6 +297,9 @@ impl JobManager {
 
     fn set_state(&mut self, job_id: u32, state: JobState) -> Option<(u8, LedAction)> {
         let &slot_i = self.job_to_slot.get(&job_id)?;
+        if self.slots[slot_i].state == Some(state.clone()) {
+            return None;
+        }
         self.slots[slot_i].state = Some(state.clone());
         let led = self.slots[slot_i].led;
         Some((led, resolve_led_action(Some(&state), &self.colors)))
@@ -322,6 +324,7 @@ impl JobManager {
         self.slots[slot_i].state = None;
         self.slots[slot_i].metadata = HashMap::new();
         self.job_to_slot.remove(&job_id);
+        self.pre_resolved.remove(&job_id);
         self.notify.notify_waiters();
         Some(led)
     }
@@ -336,6 +339,7 @@ impl JobManager {
         self.slots[slot_i].state = None;
         self.slots[slot_i].metadata = HashMap::new();
         self.job_to_slot.remove(&job_id);
+        self.pre_resolved.remove(&job_id);
         let led = self.slots[slot_i].led;
         self.notify.notify_waiters();
         Some((job_id, led))
@@ -353,10 +357,7 @@ impl JobManager {
     }
 
     /// Resolve a prompt: take the oneshot sender and return it along with the accept/reject colors.
-    fn take_prompt_responder(
-        &mut self,
-        job_id: u32,
-    ) -> Option<oneshot::Sender<bool>> {
+    fn take_prompt_responder(&mut self, job_id: u32) -> Option<oneshot::Sender<bool>> {
         self.prompt_responders.remove(&job_id)
     }
 }
@@ -451,9 +452,7 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
         None | Some(JobState::Created { .. }) => {
             color_spec_to_action(colors.idle.as_ref(), Rgb(0, 0, 0))
         }
-        Some(JobState::Started) => {
-            color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
-        }
+        Some(JobState::Started) => color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255)),
         Some(JobState::Progress { current, total }) => {
             let t = if *total == 0 {
                 0.0
@@ -555,8 +554,6 @@ enum KbdCmd {
     StopAnim { index: u8 },
     /// Auto-clear a finished slot (timeout elapsed).
     ClearFinished { job_id: u32 },
-    /// Hold threshold reached on a prompt slot — reject immediately.
-    HoldReject { col: u8, row: u8 },
     /// Trigger the accept/reject pulse animation externally (PromptResolve path).
     /// The oneshot responder has already been sent; this is purely for the LED.
     Pulse {
@@ -717,11 +714,17 @@ impl Jobs {
                 let slot_i = *st.job_to_slot.get(&job_id).unwrap();
                 st.slots[slot_i].state = Some(JobState::Started);
                 let _ = tx2.send(accepted);
-                debug!(job_id, accepted, "prompt: consumed pre-resolved answer (PromptResolve raced ahead)");
+                debug!(
+                    job_id,
+                    accepted, "prompt: consumed pre-resolved answer (PromptResolve raced ahead)"
+                );
             }
             drop(st);
 
-            info!(job_id, text, "prompt: waiting for keyboard or PromptResolve");
+            info!(
+                job_id,
+                text, "prompt: waiting for keyboard or PromptResolve"
+            );
             send_led_action(&self.cmd_tx, led, action).await;
             let _ = self
                 .status_tx
@@ -760,7 +763,10 @@ impl Jobs {
                 if st.job_to_slot.contains_key(&job_id) {
                     // Prompt() hasn't been called yet — store the answer so
                     // prompt() can consume it immediately without blocking.
-                    debug!(job_id, accepted, "PromptResolve arrived before Prompt(); pre-resolving");
+                    debug!(
+                        job_id,
+                        accepted, "PromptResolve arrived before Prompt(); pre-resolving"
+                    );
                     st.pre_resolved.insert(job_id, accepted);
                 }
                 // Either pre-stored or already fully resolved — either way done.
@@ -786,6 +792,8 @@ impl Jobs {
 
             // Unblock the waiting Prompt() DBus call.
             let _ = tx.send(accepted);
+
+            st.pre_resolved.remove(&job_id);
 
             (led, pulse_color)
         };
@@ -826,10 +834,7 @@ impl Jobs {
 
     /// Return the metadata map that was supplied when this job was created.
     /// Available for the full lifetime of the job, regardless of current state.
-    async fn get_metadata(
-        &self,
-        job_id: u32,
-    ) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+    async fn get_metadata(&self, job_id: u32) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
         let st = self.state.lock().await;
         let meta = st
             .get_metadata(job_id)
@@ -944,10 +949,6 @@ async fn keyboard_task(
                             }
                         }
                     }
-                    KbdCmd::HoldReject { col, row } => {
-                        // Unused: reserved for future hold-threshold rejection.
-                        debug!(col, row, "HoldReject received (unimplemented)");
-                    }
                     KbdCmd::Pulse { index, r, g, b, accepted, job_id } => {
                         // Triggered by PromptResolve — oneshot already sent, just animate.
                         animating.remove(&index);
@@ -1061,6 +1062,7 @@ async fn keyboard_task(
                         if let Some(responder) = ps.responder.take() {
                             let _ = responder.send(ps.accepted);
                         }
+                        state.lock().await.pre_resolved.remove(&ps.job_id);
                         let _ = status_tx
                             .send((ps.job_id, Some(JobState::Started)))
                             .await;
@@ -1154,7 +1156,12 @@ async fn main() -> Result<()> {
     // keyboard_task is running and can process Animate commands.
     if let LedAction::Animate(spec) = resolve_led_action(None, &config.colors) {
         for &led in &config.slots {
-            let _ = cmd_tx.send(KbdCmd::Animate { index: led, spec: spec.clone() }).await;
+            let _ = cmd_tx
+                .send(KbdCmd::Animate {
+                    index: led,
+                    spec: spec.clone(),
+                })
+                .await;
         }
     }
 
