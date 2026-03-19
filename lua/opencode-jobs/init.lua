@@ -322,8 +322,8 @@ function M.setup()
             if not entry or not entry.job then return end
 
             local meta = filter_session(flatten(info, "session"))
-            entry.job:set_metadata(meta)
-            log("session " .. sid_short(sid) .. ": session.updated → set_metadata")
+            entry.job:update(meta)
+            log("session " .. sid_short(sid) .. ": session.updated → update")
         end),
     })
 

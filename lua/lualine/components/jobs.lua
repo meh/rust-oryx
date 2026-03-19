@@ -20,6 +20,17 @@ local lualine_require = require("lualine_require")
 local component       = lualine_require("lualine.component"):extend()
 local a               = require("plenary.async")
 
+-- ── Debug logging ────────────────────────────────────────────────────────────
+-- Remove once things work.
+
+local function log(msg)
+    vim.schedule(function()
+        vim.notify("[jobs-lualine] " .. msg, vim.log.levels.DEBUG)
+    end)
+end
+
+log("module loaded")
+
 -- ── Nerd Font icons ──────────────────────────────────────────────────────────
 
 local STATE_ICONS = {
@@ -308,9 +319,14 @@ end
 local function subscribe(user_specs)
     if subscribed then return end
     local ok, jobs = pcall(require, "jobs")
-    if not ok then return end
+    if not ok then
+        log("subscribe: require('jobs') failed: " .. tostring(jobs))
+        return
+    end
+    log("subscribe: require('jobs') ok")
 
     state_callback = function(job_id, state_str, meta)
+        log("on_state: job=" .. tostring(job_id) .. " state=" .. tostring(state_str))
         if state_str == "cleared" then
             jobs_cache[job_id] = nil
         else
@@ -341,18 +357,25 @@ local function subscribe(user_specs)
     jobs.on_state(state_callback)
     jobs.on_metadata(meta_callback)
     subscribed = true
+    log("subscribe: signals connected")
 
     -- Seed the cache with any jobs that already exist.
     a.void(function()
+        log("subscribe: seeding cache via get_jobs()")
         local all = jobs.get_jobs()
         if all then
+            local count = 0
             for id, info in pairs(all) do
                 if not jobs_cache[id] then
                     jobs_cache[id] = info
+                    count = count + 1
                 end
             end
+            log("subscribe: seeded " .. count .. " jobs")
             sync_anim_timer(user_specs)
             schedule_refresh()
+        else
+            log("subscribe: get_jobs() returned nil")
         end
     end)()
 end
@@ -361,12 +384,14 @@ end
 
 function component:init(options)
     component.super.init(self, options)
+    log("init: options=" .. vim.inspect(options))
 
     self.user_specs  = options.colors or {}
     self.user_icons  = options.icons  or {}
     self.show_empty  = options.show_empty ~= false -- default true
     self.icon_sep    = options.separator or " "
 
+    log("init: show_empty=" .. tostring(self.show_empty))
     instances[self] = true
     subscribe(self.user_specs)
 
@@ -392,15 +417,26 @@ local function sorted_jobs()
     return list
 end
 
+local _update_count = 0
 function component:update_status()
     local jobs_list = sorted_jobs()
+
+    -- Log sparingly (every 50th call) to avoid spam.
+    _update_count = _update_count + 1
+    if _update_count <= 3 or _update_count % 50 == 0 then
+        log("update_status[" .. _update_count .. "]: " .. #jobs_list .. " jobs, show_empty=" .. tostring(self.show_empty))
+    end
 
     -- No active jobs: show idle icon or nothing.
     if #jobs_list == 0 then
         if self.show_empty then
             local idle_spec = self.user_specs.idle or DEFAULT_SPECS.idle
             set_hl("idle", idle_spec.color)
-            return "%#" .. HL_PREFIX .. "idle#" .. IDLE_ICON
+            local result = "%#" .. HL_PREFIX .. "idle#" .. IDLE_ICON
+            if _update_count <= 3 then
+                log("update_status: returning idle: " .. result)
+            end
+            return result
         end
         return ""
     end
@@ -417,7 +453,11 @@ function component:update_status()
         parts[#parts + 1] = "%#" .. HL_PREFIX .. hl_key .. "#" .. icon
     end
 
-    return table.concat(parts, self.icon_sep)
+    local result = table.concat(parts, self.icon_sep)
+    if _update_count <= 3 then
+        log("update_status: returning: " .. result)
+    end
+    return result
 end
 
 return component
