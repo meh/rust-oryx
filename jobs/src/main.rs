@@ -49,6 +49,12 @@ impl TryFrom<String> for Rgb {
     }
 }
 
+impl Rgb {
+    fn to_hex(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.0, self.1, self.2)
+    }
+}
+
 /// Which animation to run on an LED.
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -191,19 +197,30 @@ enum JobState {
     Created {
         metadata: HashMap<String, OwnedValue>,
     },
-    Started,
+    Started {
+        metadata: HashMap<String, OwnedValue>,
+    },
     Progress {
         current: u32,
         total: u32,
+        metadata: HashMap<String, OwnedValue>,
     },
-    Stage(String),
-    Prompt(String),
-    /// Transient state emitted only as a signal when a prompt resolves.
-    /// Never stored on a slot — the slot transitions directly to Started.
+    Stage {
+        name: String,
+        metadata: HashMap<String, OwnedValue>,
+    },
+    Prompt {
+        question: String,
+        metadata: HashMap<String, OwnedValue>,
+    },
     PromptResolved {
         accepted: bool,
+        metadata: HashMap<String, OwnedValue>,
     },
-    Finished(OwnedValue),
+    Finished {
+        status: OwnedValue,
+        metadata: HashMap<String, OwnedValue>,
+    },
 }
 
 struct Slot {
@@ -219,15 +236,37 @@ struct Slot {
     metadata: HashMap<String, OwnedValue>,
 }
 
+/// A job that is not bound to a physical LED/key slot.
+/// It participates in state tracking and D-Bus signals but has no keyboard
+/// interaction (no LED, no key-press clear, prompts only via PromptResolve).
+struct VirtualJob {
+    state: Option<JobState>,
+    metadata: HashMap<String, OwnedValue>,
+}
+
+/// Result of `JobManager::set_state`.
+enum SetStateResult {
+    /// Job not found (neither physical nor virtual).
+    Unknown,
+    /// State unchanged (already equal).
+    Unchanged,
+    /// Physical slot updated — carries LED index and the action to apply.
+    Physical(u8, LedAction),
+    /// Virtual job updated — no LED to drive.
+    Virtual,
+}
+
 struct JobManager {
     slots: Vec<Slot>,
     next_job_id: u32,
     job_to_slot: HashMap<u32, usize>,
     key_to_slot: HashMap<(u8, u8), usize>,
+    /// Jobs not bound to a physical slot (created with slot = -2).
+    virtual_jobs: HashMap<u32, VirtualJob>,
     colors: Colors,
     hold_ms: u64,
     notify: Arc<Notify>,
-    prompt_responders: HashMap<u32, oneshot::Sender<bool>>,
+    prompt_responders: HashMap<u32, oneshot::Sender<(bool, HashMap<String, OwnedValue>)>>,
     /// Notified whenever a prompt resolves so that blocked callers can retry.
     prompt_done: Arc<Notify>,
     /// Answer stored by `PromptResolve` when it races ahead of `Prompt()`.
@@ -235,7 +274,7 @@ struct JobManager {
     /// batch (e.g. `permission.asked` + `permission.replied` in the same
     /// 40 ms throttle window). `prompt()` drains this immediately after
     /// inserting the oneshot sender instead of blocking on it.
-    pre_resolved: HashMap<u32, bool>,
+    pre_resolved: HashMap<u32, (bool, HashMap<String, OwnedValue>)>,
 }
 
 impl JobManager {
@@ -265,6 +304,7 @@ impl JobManager {
             next_job_id: 1,
             job_to_slot: HashMap::new(),
             key_to_slot,
+            virtual_jobs: HashMap::new(),
             colors: config.colors.clone(),
             hold_ms: config.hold_ms.unwrap_or(1000),
             notify: Arc::new(Notify::new()),
@@ -300,44 +340,106 @@ impl JobManager {
         Some((id, led))
     }
 
-    fn set_state(&mut self, job_id: u32, state: JobState) -> Option<(u8, LedAction)> {
-        let &slot_i = self.job_to_slot.get(&job_id)?;
-        if self.slots[slot_i].state == Some(state.clone()) {
-            return None;
+    /// Allocate a virtual job (no physical slot/LED). Always succeeds.
+    fn alloc_virtual(&mut self, metadata: HashMap<String, OwnedValue>) -> u32 {
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.virtual_jobs.insert(
+            id,
+            VirtualJob {
+                state: Some(JobState::Created {
+                    metadata: metadata.clone(),
+                }),
+                metadata,
+            },
+        );
+        id
+    }
+
+    fn set_state(&mut self, job_id: u32, state: JobState) -> SetStateResult {
+        // Physical slot path.
+        if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
+            if self.slots[slot_i].state == Some(state.clone()) {
+                return SetStateResult::Unchanged;
+            }
+            self.slots[slot_i].state = Some(state.clone());
+            let led = self.slots[slot_i].led;
+            return SetStateResult::Physical(led, resolve_led_action(Some(&state), &self.colors));
         }
-        self.slots[slot_i].state = Some(state.clone());
-        let led = self.slots[slot_i].led;
-        Some((led, resolve_led_action(Some(&state), &self.colors)))
+        // Virtual job path.
+        if let Some(vj) = self.virtual_jobs.get_mut(&job_id) {
+            if vj.state == Some(state.clone()) {
+                return SetStateResult::Unchanged;
+            }
+            vj.state = Some(state);
+            return SetStateResult::Virtual;
+        }
+        SetStateResult::Unknown
     }
 
     fn get_state(&self, job_id: u32) -> Option<&JobState> {
-        let &slot_i = self.job_to_slot.get(&job_id)?;
-        self.slots[slot_i].state.as_ref()
+        if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
+            return self.slots[slot_i].state.as_ref();
+        }
+        self.virtual_jobs.get(&job_id)?.state.as_ref()
     }
 
     fn get_metadata(&self, job_id: u32) -> Option<&HashMap<String, OwnedValue>> {
-        let &slot_i = self.job_to_slot.get(&job_id)?;
-        Some(&self.slots[slot_i].metadata)
+        if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
+            return Some(&self.slots[slot_i].metadata);
+        }
+        Some(&self.virtual_jobs.get(&job_id)?.metadata)
     }
 
-    /// Unconditionally free a slot by job_id. Returns the LED index if the
-    /// slot was found. Used for timeout-based auto-clear of Finished slots.
-    fn force_clear(&mut self, job_id: u32) -> Option<u8> {
-        let &slot_i = self.job_to_slot.get(&job_id)?;
-        let led = self.slots[slot_i].led;
-        self.slots[slot_i].job_id = None;
-        self.slots[slot_i].state = None;
-        self.slots[slot_i].metadata = HashMap::new();
-        self.job_to_slot.remove(&job_id);
-        self.pre_resolved.remove(&job_id);
-        self.notify.notify_waiters();
-        Some(led)
+    /// Check whether a job_id exists (physical or virtual).
+    fn job_exists(&self, job_id: u32) -> bool {
+        self.job_to_slot.contains_key(&job_id) || self.virtual_jobs.contains_key(&job_id)
+    }
+
+    /// Merge `updates` into the job's creation metadata.
+    /// Returns the full metadata map after merging, or `None` if the job
+    /// doesn't exist.
+    fn update_metadata(
+        &mut self,
+        job_id: u32,
+        updates: HashMap<String, OwnedValue>,
+    ) -> Option<HashMap<String, OwnedValue>> {
+        if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
+            self.slots[slot_i].metadata.extend(updates);
+            return Some(self.slots[slot_i].metadata.clone());
+        }
+        if let Some(vj) = self.virtual_jobs.get_mut(&job_id) {
+            vj.metadata.extend(updates);
+            return Some(vj.metadata.clone());
+        }
+        None
+    }
+
+    /// Unconditionally free a job by job_id.
+    /// Returns `Some(Some(led))` for physical slots, `Some(None)` for virtual
+    /// jobs, or `None` if the job was not found.
+    fn force_clear(&mut self, job_id: u32) -> Option<Option<u8>> {
+        if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
+            let led = self.slots[slot_i].led;
+            self.slots[slot_i].job_id = None;
+            self.slots[slot_i].state = None;
+            self.slots[slot_i].metadata = HashMap::new();
+            self.job_to_slot.remove(&job_id);
+            self.pre_resolved.remove(&job_id);
+            self.notify.notify_waiters();
+            return Some(Some(led));
+        }
+        if self.virtual_jobs.remove(&job_id).is_some() {
+            self.pre_resolved.remove(&job_id);
+            return Some(None);
+        }
+        None
     }
 
     /// Called on KeyUp for a slot. Returns the cleared job_id if it was Finished.
     fn try_clear(&mut self, col: u8, row: u8) -> Option<(u32, u8)> {
         let &slot_i = self.key_to_slot.get(&(col, row))?;
-        if !matches!(self.slots[slot_i].state, Some(JobState::Finished(_))) {
+        if !matches!(self.slots[slot_i].state, Some(JobState::Finished { .. })) {
             return None;
         }
         let job_id = self.slots[slot_i].job_id.take()?;
@@ -354,7 +456,7 @@ impl JobManager {
     /// Returns (job_id, led_index) if so.
     fn get_prompt_slot(&self, col: u8, row: u8) -> Option<(u32, u8)> {
         let &slot_i = self.key_to_slot.get(&(col, row))?;
-        if !matches!(self.slots[slot_i].state, Some(JobState::Prompt(_))) {
+        if !matches!(self.slots[slot_i].state, Some(JobState::Prompt { .. })) {
             return None;
         }
         let job_id = self.slots[slot_i].job_id?;
@@ -362,7 +464,10 @@ impl JobManager {
     }
 
     /// Resolve a prompt: take the oneshot sender and return it along with the accept/reject colors.
-    fn take_prompt_responder(&mut self, job_id: u32) -> Option<oneshot::Sender<bool>> {
+    fn take_prompt_responder(
+        &mut self,
+        job_id: u32,
+    ) -> Option<oneshot::Sender<(bool, HashMap<String, OwnedValue>)>> {
         self.prompt_responders.remove(&job_id)
     }
 }
@@ -457,8 +562,10 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
         None | Some(JobState::Created { .. }) => {
             color_spec_to_action(colors.idle.as_ref(), Rgb(0, 0, 0))
         }
-        Some(JobState::Started) => color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255)),
-        Some(JobState::Progress { current, total }) => {
+        Some(JobState::Started { .. }) => {
+            color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
+        }
+        Some(JobState::Progress { current, total, .. }) => {
             let t = if *total == 0 {
                 0.0
             } else {
@@ -469,7 +576,7 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
             let (r, g, b) = lerp_rgb(start, end, t);
             LedAction::Static(r, g, b)
         }
-        Some(JobState::Stage(name)) => {
+        Some(JobState::Stage { name, .. }) => {
             let cs = colors
                 .stage
                 .matches
@@ -479,7 +586,7 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
                 .or_else(|| colors.stage.default.as_ref());
             color_spec_to_action(cs, Rgb(255, 200, 0))
         }
-        Some(JobState::Prompt(_)) => {
+        Some(JobState::Prompt { .. }) => {
             // Always animate for the prompt state; default to breathe at purple.
             let spec = match &colors.prompt.waiting {
                 Some(ColorSpec::Animated(s)) => s.clone(),
@@ -503,7 +610,7 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
         Some(JobState::PromptResolved { .. }) => {
             color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
         }
-        Some(JobState::Finished(v)) => {
+        Some(JobState::Finished { status: v, .. }) => {
             let cs = colors
                 .finished
                 .matches
@@ -522,37 +629,42 @@ fn state_to_signal(state: Option<&JobState>) -> (&'static str, HashMap<String, O
     match state {
         None => ("cleared", HashMap::new()),
         Some(JobState::Created { metadata }) => ("created", metadata.clone()),
-        Some(JobState::Started) => ("started", HashMap::new()),
-        Some(JobState::Progress { current, total }) => (
-            "progress",
-            [
-                ("current".to_string(), OwnedValue::from(*current)),
-                ("total".to_string(), OwnedValue::from(*total)),
-            ]
-            .into(),
-        ),
-        Some(JobState::Stage(name)) => (
-            "stage",
-            [(
+        Some(JobState::Started { metadata }) => ("started", metadata.clone()),
+        Some(JobState::Progress {
+            current,
+            total,
+            metadata,
+        }) => {
+            let mut m = metadata.clone();
+            m.insert("current".to_string(), OwnedValue::from(*current));
+            m.insert("total".to_string(), OwnedValue::from(*total));
+            ("progress", m)
+        }
+        Some(JobState::Stage { name, metadata }) => {
+            let mut m = metadata.clone();
+            m.insert(
                 "name".to_string(),
                 OwnedValue::from(zbus::zvariant::Str::from(name.as_str())),
-            )]
-            .into(),
-        ),
-        Some(JobState::Prompt(text)) => (
-            "prompt",
-            [(
-                "text".to_string(),
-                OwnedValue::from(zbus::zvariant::Str::from(text.as_str())),
-            )]
-            .into(),
-        ),
-        Some(JobState::PromptResolved { accepted }) => (
-            "prompt_resolved",
-            [("accepted".to_string(), OwnedValue::from(*accepted))].into(),
-        ),
-        Some(JobState::Finished(value)) => {
-            ("finished", [("value".to_string(), value.clone())].into())
+            );
+            ("stage", m)
+        }
+        Some(JobState::Prompt { question, metadata }) => {
+            let mut m = metadata.clone();
+            m.insert(
+                "question".to_string(),
+                OwnedValue::from(zbus::zvariant::Str::from(question.as_str())),
+            );
+            ("prompt", m)
+        }
+        Some(JobState::PromptResolved { accepted, metadata }) => {
+            let mut m = metadata.clone();
+            m.insert("accepted".to_string(), OwnedValue::from(*accepted));
+            ("prompt_resolved", m)
+        }
+        Some(JobState::Finished { status, metadata }) => {
+            let mut m = metadata.clone();
+            m.insert("status".to_string(), status.clone());
+            ("finished", m)
         }
     }
 }
@@ -580,6 +692,87 @@ enum KbdCmd {
     },
 }
 
+// ── Color spec serialization for GetColors ───────────────────────────────────
+
+fn static_color_variant(rgb: Rgb) -> HashMap<String, OwnedValue> {
+    HashMap::from([
+        (
+            "type".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from("static")),
+        ),
+        (
+            "color".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from(rgb.to_hex())),
+        ),
+    ])
+}
+
+fn anim_spec_variant(spec: &AnimSpec) -> HashMap<String, OwnedValue> {
+    let type_str = match spec.animation {
+        AnimKind::Breathe => "breathe",
+        AnimKind::Bounce => "bounce",
+    };
+    let gradient = spec.gradient();
+    let primary = gradient.first().copied().unwrap_or(Rgb(255, 255, 255));
+    let colors_strs: Vec<String> = gradient.iter().map(|c| c.to_hex()).collect();
+
+    let mut map = HashMap::from([
+        (
+            "type".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from(type_str)),
+        ),
+        (
+            "color".to_string(),
+            OwnedValue::from(zbus::zvariant::Str::from(primary.to_hex())),
+        ),
+        (
+            "period-ms".to_string(),
+            OwnedValue::from(spec.period() as f64),
+        ),
+    ]);
+
+    if colors_strs.len() > 1 {
+        let arr: zbus::zvariant::Array = colors_strs
+            .into_iter()
+            .map(|s| zbus::zvariant::Value::from(zbus::zvariant::Str::from(s)))
+            .collect::<Vec<_>>()
+            .into();
+        map.insert(
+            "colors".to_string(),
+            OwnedValue::try_from(Value::Array(arr)).unwrap(),
+        );
+    }
+
+    map
+}
+
+fn color_spec_variant(cs: Option<&ColorSpec>, default: Rgb) -> HashMap<String, OwnedValue> {
+    match cs {
+        Some(ColorSpec::Static(rgb)) => static_color_variant(*rgb),
+        Some(ColorSpec::Animated(spec)) => anim_spec_variant(spec),
+        None => static_color_variant(default),
+    }
+}
+
+/// Serialize the prompt waiting spec, which always promotes to breathe.
+fn prompt_waiting_variant(colors: &Colors) -> HashMap<String, OwnedValue> {
+    match &colors.prompt.waiting {
+        Some(ColorSpec::Animated(s)) => anim_spec_variant(s),
+        Some(ColorSpec::Static(rgb)) => anim_spec_variant(&AnimSpec {
+            animation: AnimKind::Breathe,
+            color: Some(*rgb),
+            colors: vec![],
+            period_ms: None,
+        }),
+        None => anim_spec_variant(&AnimSpec {
+            animation: AnimKind::Breathe,
+            color: Some(Rgb(200, 0, 255)),
+            colors: vec![],
+            period_ms: None,
+        }),
+    }
+}
+
 // ── DBus interface ────────────────────────────────────────────────────────────
 
 /// Dispatch a `LedAction` to `keyboard_task` via the command channel.
@@ -601,6 +794,7 @@ struct Jobs {
     state: Arc<Mutex<JobManager>>,
     cmd_tx: mpsc::Sender<KbdCmd>,
     status_tx: mpsc::Sender<(u32, Option<JobState>)>,
+    metadata_tx: mpsc::Sender<(u32, HashMap<String, OwnedValue>)>,
 }
 
 #[interface(name = "zsa.oryx.Jobs")]
@@ -611,6 +805,19 @@ impl Jobs {
         slot: i32,
         timeout_ms: i32,
     ) -> zbus::fdo::Result<u32> {
+        // slot == -2 → virtual job (no physical LED/key).
+        if slot == -2 {
+            let mut st = self.state.lock().await;
+            let id = st.alloc_virtual(metadata.clone());
+            drop(st);
+            info!(job_id = id, "virtual job created");
+            let _ = self
+                .status_tx
+                .send((id, Some(JobState::Created { metadata })))
+                .await;
+            return Ok(id);
+        }
+
         let timeout = if timeout_ms < 0 {
             None
         } else {
@@ -673,26 +880,51 @@ impl Jobs {
         }
     }
 
-    async fn start(&self, job_id: u32) -> zbus::fdo::Result<()> {
-        self.update(job_id, JobState::Started).await
+    async fn start(
+        &self,
+        job_id: u32,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        self.update(job_id, JobState::Started { metadata }).await
     }
 
-    async fn progress(&self, job_id: u32, current: u32, total: u32) -> zbus::fdo::Result<()> {
-        self.update(job_id, JobState::Progress { current, total })
+    async fn progress(
+        &self,
+        job_id: u32,
+        current: u32,
+        total: u32,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        self.update(
+            job_id,
+            JobState::Progress {
+                current,
+                total,
+                metadata,
+            },
+        )
+        .await
+    }
+
+    async fn stage(
+        &self,
+        job_id: u32,
+        name: String,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        self.update(job_id, JobState::Stage { name, metadata })
             .await
-    }
-
-    async fn stage(&self, job_id: u32, name: String) -> zbus::fdo::Result<()> {
-        self.update(job_id, JobState::Stage(name)).await
     }
 
     async fn finish(
         &self,
         job_id: u32,
-        value: OwnedValue,
+        status: OwnedValue,
         timeout_ms: i32,
+        metadata: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<()> {
-        self.update(job_id, JobState::Finished(value)).await?;
+        self.update(job_id, JobState::Finished { status, metadata })
+            .await?;
         if timeout_ms >= 0 {
             info!(job_id, timeout_ms, "finished: auto-clear scheduled");
             let cmd_tx = self.cmd_tx.clone();
@@ -714,24 +946,57 @@ impl Jobs {
     /// Returns immediately. The result is delivered asynchronously via the
     /// `State` signal with state `"prompt_resolved"` and metadata
     /// `{ accepted: bool }`.
-    async fn prompt(&self, job_id: u32, text: String) -> zbus::fdo::Result<()> {
+    async fn prompt(
+        &self,
+        job_id: u32,
+        question: String,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
         let (tx, rx) = oneshot::channel();
+        let prompt_metadata = metadata.clone();
 
+        // led is Some(index) for physical slots, None for virtual jobs.
         let led = {
             let mut st = self.state.lock().await;
-            let (led, action) = st
-                .set_state(job_id, JobState::Prompt(text.clone()))
-                .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
+            let led = match st.set_state(
+                job_id,
+                JobState::Prompt {
+                    question: question.clone(),
+                    metadata,
+                },
+            ) {
+                SetStateResult::Physical(led, action) => {
+                    send_led_action(&self.cmd_tx, led, action).await;
+                    Some(led)
+                }
+                SetStateResult::Virtual => None,
+                SetStateResult::Unknown => {
+                    return Err(zbus::fdo::Error::Failed(format!("unknown job {job_id}")));
+                }
+                SetStateResult::Unchanged => {
+                    // Already in Prompt state with same text — still register
+                    // the responder so the caller gets an answer.
+                    None
+                }
+            };
             st.prompt_responders.insert(job_id, tx);
 
             // Drain any answer that PromptResolve() stored before we arrived.
             // This happens when permission.asked + permission.replied land in
             // the same Neovim event batch: PromptResolve races ahead of Prompt().
-            if let Some(accepted) = st.pre_resolved.remove(&job_id) {
+            if let Some((accepted, resolve_meta)) = st.pre_resolved.remove(&job_id) {
                 let tx2 = st.prompt_responders.remove(&job_id).unwrap();
-                let slot_i = *st.job_to_slot.get(&job_id).unwrap();
-                st.slots[slot_i].state = Some(JobState::Started);
-                let _ = tx2.send(accepted);
+                // Revert to Started: physical slot path.
+                if let Some(&slot_i) = st.job_to_slot.get(&job_id) {
+                    st.slots[slot_i].state = Some(JobState::Started {
+                        metadata: HashMap::new(),
+                    });
+                } else if let Some(vj) = st.virtual_jobs.get_mut(&job_id) {
+                    vj.state = Some(JobState::Started {
+                        metadata: HashMap::new(),
+                    });
+                }
+                let _ = tx2.send((accepted, resolve_meta));
                 debug!(
                     job_id,
                     accepted, "prompt: consumed pre-resolved answer (PromptResolve raced ahead)"
@@ -741,12 +1006,17 @@ impl Jobs {
 
             info!(
                 job_id,
-                text, "prompt: waiting for keyboard or PromptResolve"
+                question, "prompt: waiting for keyboard or PromptResolve"
             );
-            send_led_action(&self.cmd_tx, led, action).await;
             let _ = self
                 .status_tx
-                .send((job_id, Some(JobState::Prompt(text))))
+                .send((
+                    job_id,
+                    Some(JobState::Prompt {
+                        question,
+                        metadata: prompt_metadata.clone(),
+                    }),
+                ))
                 .await;
             led
         };
@@ -758,7 +1028,7 @@ impl Jobs {
         let status_tx = self.status_tx.clone();
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
-            let accepted = match rx.await {
+            let (accepted, resolve_meta) = match rx.await {
                 Ok(v) => v,
                 Err(_) => {
                     // Oneshot dropped without sending — job was cleared while
@@ -769,12 +1039,25 @@ impl Jobs {
                 }
             };
 
-            // Stop animation.
-            let _ = cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
+            // Stop animation (only for physical slots).
+            if let Some(led) = led {
+                let _ = cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
+            }
+
+            // Merge the resolve metadata (from PromptResolve) into the prompt
+            // metadata (from Prompt), letting resolve values override.
+            let mut merged = prompt_metadata.clone();
+            merged.extend(resolve_meta);
 
             // Emit the prompt_resolved signal so Lua callers get the result.
             let _ = status_tx
-                .send((job_id, Some(JobState::PromptResolved { accepted })))
+                .send((
+                    job_id,
+                    Some(JobState::PromptResolved {
+                        accepted,
+                        metadata: merged,
+                    }),
+                ))
                 .await;
 
             // Wake any callers that were blocked waiting for this prompt to finish.
@@ -793,18 +1076,23 @@ impl Jobs {
     /// `prompt_done`.
     ///
     /// Returns `Ok(())` silently if the prompt was already resolved (race is fine).
-    async fn prompt_resolve(&self, job_id: u32, accepted: bool) -> zbus::fdo::Result<()> {
+    async fn prompt_resolve(
+        &self,
+        job_id: u32,
+        accepted: bool,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
         let mut st = self.state.lock().await;
 
-        if !matches!(st.get_state(job_id), Some(JobState::Prompt(_))) {
-            if st.job_to_slot.contains_key(&job_id) {
+        if !matches!(st.get_state(job_id), Some(JobState::Prompt { .. })) {
+            if st.job_exists(job_id) {
                 // Prompt() hasn't been called yet — store the answer so
                 // prompt() can consume it immediately without blocking.
                 debug!(
                     job_id,
                     accepted, "PromptResolve arrived before Prompt(); pre-resolving"
                 );
-                st.pre_resolved.insert(job_id, accepted);
+                st.pre_resolved.insert(job_id, (accepted, metadata));
             }
             // Either pre-stored or already fully resolved — either way done.
             return Ok(());
@@ -815,40 +1103,52 @@ impl Jobs {
             None => return Ok(()), // responder already consumed by keyboard
         };
 
-        let &slot_i = st.job_to_slot.get(&job_id).unwrap();
-        let led = st.slots[slot_i].led;
-
-        // Transition state back to Started (mirrors the keyboard path).
-        st.slots[slot_i].state = Some(JobState::Started);
-
-        let pulse_color = if accepted {
-            st.colors.prompt.accept.unwrap_or(Rgb(0, 255, 0))
+        // Transition state back to Started and resolve the LED for physical slots.
+        let led = if let Some(&slot_i) = st.job_to_slot.get(&job_id) {
+            let led = st.slots[slot_i].led;
+            st.slots[slot_i].state = Some(JobState::Started {
+                metadata: HashMap::new(),
+            });
+            Some(led)
+        } else if let Some(vj) = st.virtual_jobs.get_mut(&job_id) {
+            vj.state = Some(JobState::Started {
+                metadata: HashMap::new(),
+            });
+            None
         } else {
-            st.colors.prompt.reject.unwrap_or(Rgb(255, 0, 0))
+            None
         };
 
-        // Send accepted/rejected through the oneshot. The background task
-        // spawned by prompt() will pick this up, emit the prompt_resolved
+        let pulse_color = if accepted {
+            st.colors.prompt.accept.unwrap_or(Rgb(0, 122, 0))
+        } else {
+            st.colors.prompt.reject.unwrap_or(Rgb(204, 0, 0))
+        };
+
+        // Send accepted/rejected + metadata through the oneshot. The background
+        // task spawned by prompt() will pick this up, emit the prompt_resolved
         // signal, and notify prompt_done.
-        let _ = tx.send(accepted);
+        let _ = tx.send((accepted, metadata));
 
         st.pre_resolved.remove(&job_id);
         drop(st);
 
         info!(job_id, accepted, "prompt resolved via PromptResolve");
 
-        // Trigger the pulse animation in keyboard_task.
-        let _ = self
-            .cmd_tx
-            .send(KbdCmd::Pulse {
-                index: led,
-                r: pulse_color.0,
-                g: pulse_color.1,
-                b: pulse_color.2,
-                accepted,
-                job_id,
-            })
-            .await;
+        // Trigger the pulse animation in keyboard_task (physical slots only).
+        if let Some(led) = led {
+            let _ = self
+                .cmd_tx
+                .send(KbdCmd::Pulse {
+                    index: led,
+                    r: pulse_color.0,
+                    g: pulse_color.1,
+                    b: pulse_color.2,
+                    accepted,
+                    job_id,
+                })
+                .await;
+        }
 
         Ok(())
     }
@@ -858,23 +1158,27 @@ impl Jobs {
     /// if the job is already gone or not yet finished (idempotent).
     async fn clear(&self, job_id: u32) -> zbus::fdo::Result<()> {
         let mut st = self.state.lock().await;
-        if !matches!(st.get_state(job_id), Some(JobState::Finished(_))) {
+        if !matches!(st.get_state(job_id), Some(JobState::Finished { .. })) {
             return Ok(());
         }
-        let led = st
+        let maybe_led = st
             .force_clear(job_id)
-            .expect("state was Finished so slot must exist");
+            .expect("state was Finished so job must exist");
         drop(st);
-        info!(job_id, led, "job cleared via Clear()");
-        let _ = self
-            .cmd_tx
-            .send(KbdCmd::SetRgb {
-                index: led,
-                r: 0,
-                g: 0,
-                b: 0,
-            })
-            .await;
+        if let Some(led) = maybe_led {
+            info!(job_id, led, "job cleared via Clear()");
+            let _ = self
+                .cmd_tx
+                .send(KbdCmd::SetRgb {
+                    index: led,
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                })
+                .await;
+        } else {
+            info!(job_id, "virtual job cleared via Clear()");
+        }
         let _ = self.status_tx.send((job_id, None)).await;
         Ok(())
     }
@@ -891,7 +1195,8 @@ impl Jobs {
         Ok((state_str.to_string(), meta))
     }
 
-    /// Return the metadata map that was supplied when this job was created.
+    /// Return the metadata map that was supplied when this job was created
+    /// (including any later updates via `Metadata()`).
     /// Available for the full lifetime of the job, regardless of current state.
     async fn get_metadata(&self, job_id: u32) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
         let st = self.state.lock().await;
@@ -901,11 +1206,79 @@ impl Jobs {
         Ok(meta.clone())
     }
 
+    /// Merge key-value pairs into the job's creation metadata.
+    /// Existing keys are overwritten; keys not in `updates` are preserved.
+    /// Emits the `MetadataChanged` signal with the full metadata after merging.
+    async fn set_metadata(
+        &self,
+        job_id: u32,
+        updates: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        let mut st = self.state.lock().await;
+        let merged = st
+            .update_metadata(job_id, updates)
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
+        drop(st);
+        info!(job_id, "metadata updated");
+        let _ = self.metadata_tx.send((job_id, merged)).await;
+        Ok(())
+    }
+
+    /// Return the daemon's resolved color configuration as a dict of dicts.
+    /// Each value is `a{sv}` with keys: type, color, [colors], [periodMs].
+    /// Used by the noctalia desktop widget to seed its defaults.
+    async fn get_colors(&self) -> zbus::fdo::Result<HashMap<String, HashMap<String, OwnedValue>>> {
+        let st = self.state.lock().await;
+        let c = &st.colors;
+        Ok(HashMap::from([
+            (
+                "idle".into(),
+                color_spec_variant(c.idle.as_ref(), Rgb(0, 0, 0)),
+            ),
+            (
+                "started".into(),
+                color_spec_variant(c.started.as_ref(), Rgb(0, 100, 255)),
+            ),
+            (
+                "progress-start".into(),
+                static_color_variant(c.progress.start.unwrap_or(Rgb(0, 100, 255))),
+            ),
+            (
+                "progress-end".into(),
+                static_color_variant(c.progress.end.unwrap_or(Rgb(0, 255, 100))),
+            ),
+            (
+                "finished-default".into(),
+                color_spec_variant(c.finished.default.as_ref(), Rgb(180, 180, 180)),
+            ),
+            (
+                "stage-default".into(),
+                color_spec_variant(c.stage.default.as_ref(), Rgb(255, 200, 0)),
+            ),
+            ("prompt-waiting".into(), prompt_waiting_variant(c)),
+            (
+                "prompt-accept".into(),
+                static_color_variant(c.prompt.accept.unwrap_or(Rgb(0, 122, 0))),
+            ),
+            (
+                "prompt-reject".into(),
+                static_color_variant(c.prompt.reject.unwrap_or(Rgb(204, 0, 0))),
+            ),
+        ]))
+    }
+
     #[zbus(signal)]
-    async fn state(
+    async fn state_changed(
         emitter: &SignalEmitter<'_>,
         job_id: u32,
         state: &str,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn metadata_changed(
+        emitter: &SignalEmitter<'_>,
+        job_id: u32,
         metadata: HashMap<String, OwnedValue>,
     ) -> zbus::Result<()>;
 }
@@ -913,30 +1286,46 @@ impl Jobs {
 impl Jobs {
     async fn update(&self, job_id: u32, state: JobState) -> zbus::fdo::Result<()> {
         // If the job is currently in Prompt state, wait for it to resolve first.
-        let (led, action) = loop {
+        let result = loop {
             let mut st = self.state.lock().await;
-            if matches!(st.get_state(job_id), Some(JobState::Prompt(_))) {
+            if matches!(st.get_state(job_id), Some(JobState::Prompt { .. })) {
                 let prompt_done = Arc::clone(&st.prompt_done);
                 drop(st);
                 prompt_done.notified().await;
                 continue;
             }
-            break st
-                .set_state(job_id, state.clone())
-                .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
+            break st.set_state(job_id, state.clone());
         };
-        match &state {
-            JobState::Started => info!(job_id, "started"),
-            JobState::Progress { current, total } => {
-                info!(job_id, current, total, "progress")
+        match result {
+            SetStateResult::Unknown => {
+                return Err(zbus::fdo::Error::Failed(format!("unknown job {job_id}")));
             }
-            JobState::Stage(name) => info!(job_id, stage = name, "stage"),
-            JobState::Finished(v) => info!(job_id, value = ?v, "finished"),
-            // Created is handled in create(); Prompt is handled in prompt().
-            _ => {}
+            SetStateResult::Unchanged => return Ok(()),
+            SetStateResult::Physical(led, action) => {
+                match &state {
+                    JobState::Started { .. } => info!(job_id, "started"),
+                    JobState::Progress { current, total, .. } => {
+                        info!(job_id, current, total, "progress")
+                    }
+                    JobState::Stage { name, .. } => info!(job_id, stage = name, "stage"),
+                    JobState::Finished { status: v, .. } => info!(job_id, value = ?v, "finished"),
+                    _ => {}
+                }
+                debug!(job_id, led, "LED updated");
+                send_led_action(&self.cmd_tx, led, action).await;
+            }
+            SetStateResult::Virtual => match &state {
+                JobState::Started { .. } => info!(job_id, "virtual started"),
+                JobState::Progress { current, total, .. } => {
+                    info!(job_id, current, total, "virtual progress")
+                }
+                JobState::Stage { name, .. } => info!(job_id, stage = name, "virtual stage"),
+                JobState::Finished { status: v, .. } => {
+                    info!(job_id, value = ?v, "virtual finished")
+                }
+                _ => {}
+            },
         }
-        debug!(job_id, led, "LED updated");
-        send_led_action(&self.cmd_tx, led, action).await;
         let _ = self.status_tx.send((job_id, Some(state))).await;
         Ok(())
     }
@@ -946,7 +1335,6 @@ impl Jobs {
 
 struct AnimState {
     spec: AnimSpec,
-    start: Instant,
 }
 
 struct PulseState {
@@ -971,6 +1359,10 @@ async fn keyboard_task(
     cmd_tx: mpsc::Sender<KbdCmd>,
     state: Arc<Mutex<JobManager>>,
 ) {
+    // Global epoch shared by all animations so same-period animations stay in
+    // phase regardless of when they were started.
+    let epoch = Instant::now();
+
     let mut animating: HashMap<u8, AnimState> = HashMap::new();
     let mut pulsing: HashMap<u8, PulseState> = HashMap::new();
     let mut keydown_times: HashMap<(u8, u8), Instant> = HashMap::new();
@@ -987,10 +1379,7 @@ async fn keyboard_task(
                         let _ = kbd.rgb(index, r, g, b).await;
                     }
                     KbdCmd::Animate { index, spec } => {
-                        animating.insert(index, AnimState {
-                            spec,
-                            start: Instant::now(),
-                        });
+                        animating.insert(index, AnimState { spec });
                     }
                     KbdCmd::StopAnim { index } => {
                         animating.remove(&index);
@@ -998,12 +1387,16 @@ async fn keyboard_task(
                     KbdCmd::ClearFinished { job_id } => {
                         let mut st = state.lock().await;
                         // Guard: a key press may have already cleared this slot.
-                        if matches!(st.get_state(job_id), Some(JobState::Finished(_))) {
-                            if let Some(led) = st.force_clear(job_id) {
+                        if matches!(st.get_state(job_id), Some(JobState::Finished { .. })) {
+                            if let Some(maybe_led) = st.force_clear(job_id) {
                                 drop(st);
-                                info!(job_id, led, "job auto-cleared by timeout");
-                                animating.remove(&led);
-                                let _ = kbd.rgb(led, 0, 0, 0).await;
+                                if let Some(led) = maybe_led {
+                                    info!(job_id, led, "job auto-cleared by timeout");
+                                    animating.remove(&led);
+                                    let _ = kbd.rgb(led, 0, 0, 0).await;
+                                } else {
+                                    info!(job_id, "virtual job auto-cleared by timeout");
+                                }
                                 let _ = status_tx.send((job_id, None)).await;
                             }
                         }
@@ -1039,8 +1432,8 @@ async fn keyboard_task(
                         // Check prompt slots first.
                         if let Some((job_id, led)) = st.get_prompt_slot(col, row) {
                             let hold_ms = st.hold_ms;
-                            let accept_color = st.colors.prompt.accept.unwrap_or(Rgb(0, 255, 0));
-                            let reject_color = st.colors.prompt.reject.unwrap_or(Rgb(255, 0, 0));
+                            let accept_color = st.colors.prompt.accept.unwrap_or(Rgb(0, 122, 0));
+                            let reject_color = st.colors.prompt.reject.unwrap_or(Rgb(204, 0, 0));
 
                             let down_time = keydown_times.remove(&(col, row));
                             let held_ms = down_time
@@ -1054,12 +1447,12 @@ async fn keyboard_task(
                             // background task (spawned by prompt()) picks it up
                             // and emits the prompt_resolved signal.
                             if let Some(responder) = st.take_prompt_responder(job_id) {
-                                let _ = responder.send(accepted);
+                                let _ = responder.send((accepted, HashMap::new()));
                             }
 
                             // Transition state back to Started (prompt is resolved).
                             let slot_i = *st.job_to_slot.get(&job_id).unwrap();
-                            st.slots[slot_i].state = Some(JobState::Started);
+                            st.slots[slot_i].state = Some(JobState::Started { metadata: HashMap::new() });
                             drop(st);
 
                             // Stop animating, start pulse.
@@ -1091,9 +1484,10 @@ async fn keyboard_task(
             _ = anim_interval.tick() => {
                 let now = Instant::now();
 
-                // Update animated LEDs.
+                // Update animated LEDs.  All animations share the global epoch
+                // so same-period animations stay perfectly in phase.
+                let elapsed = now.duration_since(epoch).as_millis() as f32;
                 for (&led, anim) in &animating {
-                    let elapsed = now.duration_since(anim.start).as_millis() as f32;
                     let (r, g, b) = sample_anim(&anim.spec, elapsed);
                     let _ = kbd.rgb(led, r, g, b).await;
                 }
@@ -1197,6 +1591,7 @@ async fn main() -> Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<KbdCmd>(32);
     let (status_tx, mut status_rx) = mpsc::channel::<(u32, Option<JobState>)>(32);
+    let (metadata_tx, mut metadata_rx) = mpsc::channel::<(u32, HashMap<String, OwnedValue>)>(32);
 
     tokio::spawn(keyboard_task(
         kbd,
@@ -1223,6 +1618,7 @@ async fn main() -> Result<()> {
         state,
         cmd_tx,
         status_tx,
+        metadata_tx,
     };
 
     let conn = connection::Builder::session()
@@ -1242,12 +1638,21 @@ async fn main() -> Result<()> {
         .await
         .context("getting interface ref")?;
 
+    let iface_ref2 = iface_ref.clone();
     tokio::spawn(async move {
         while let Some((job_id, job_state)) = status_rx.recv().await {
             let emitter = iface_ref.signal_emitter();
             let (state_str, meta) = state_to_signal(job_state.as_ref());
-            debug!(job_id, state = state_str, "emitting State signal");
-            let _ = Jobs::state(emitter, job_id, state_str, meta).await;
+            debug!(job_id, state = state_str, "emitting StateChanged signal");
+            let _ = Jobs::state_changed(emitter, job_id, state_str, meta).await;
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some((job_id, meta)) = metadata_rx.recv().await {
+            let emitter = iface_ref2.signal_emitter();
+            debug!(job_id, "emitting MetadataChanged signal");
+            let _ = Jobs::metadata_changed(emitter, job_id, meta).await;
         }
     });
 

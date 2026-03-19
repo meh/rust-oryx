@@ -1,0 +1,31 @@
+{
+  "id": "jobs",
+  "name": "Jobs",
+  "version": "0.2.0",
+  "minNoctaliaVersion": "3.6.0",
+  "author": "meh",
+  "license": "WTFPL",
+  "description": "Shows jobs state in the bar and allows responding to prompts.",
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml",
+    "settings": "Settings.qml"
+  },
+  "dependencies": {
+    "plugins": []
+  },
+  "metadata": {
+    "defaultSettings": {
+      "colorIdle": { "type": "static", "color": "#000000" },
+      "colorStarted": { "type": "static", "color": "#0064FF" },
+      "colorProgressStart": { "type": "static", "color": "#0064FF" },
+      "colorProgressEnd": { "type": "static", "color": "#00FF64" },
+      "colorFinishedDefault": { "type": "static", "color": "#B4B4B4" },
+      "colorStageDefault": { "type": "static", "color": "#FFC800" },
+      "colorPromptWaiting": { "type": "breathe", "color": "#C800FF", "periodMs": 1500 },
+      "colorPromptAccept": { "type": "static", "color": "#007A00" },
+      "colorPromptReject": { "type": "static", "color": "#CC0000" }
+    }
+  }
+}

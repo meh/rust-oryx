@@ -1,0 +1,40 @@
+{
+  "colorIdle": {
+    "type": "static",
+    "color": "#000000"
+  },
+  "colorStarted": {
+    "type": "static",
+    "color": "#a7a7a7"
+  },
+  "colorProgressStart": {
+    "type": "static",
+    "color": "#3c3c3c"
+  },
+  "colorProgressEnd": {
+    "type": "static",
+    "color": "#dddddd"
+  },
+  "colorFinishedDefault": {
+    "type": "static",
+    "color": "#dddddd"
+  },
+  "colorStageDefault": {
+    "type": "static",
+    "color": "#dddddd",
+    "periodMs": 1500
+  },
+  "colorPromptWaiting": {
+    "type": "breathe",
+    "color": "#dddddd",
+    "periodMs": 1500
+  },
+  "colorPromptAccept": {
+    "type": "static",
+    "color": "#00FF00"
+  },
+  "colorPromptReject": {
+    "type": "static",
+    "color": "#FF0000"
+  }
+}

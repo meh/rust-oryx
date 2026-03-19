@@ -12,9 +12,9 @@
 --
 --   a.void(function()
 --     local job = jobs.create({ name = "build", source = "terminal" })
---     job:start()
---     job:progress(50, 100)
---     job:finish()
+--     job:start()           -- or job:start({ key = "value" })
+--     job:progress(50, 100) -- or job:progress(50, 100, { key = "value" })
+--     job:finish()          -- or job:finish(0, 3000, { key = "value" })
 --   end)()
 --
 --   a.void(function()
@@ -108,7 +108,7 @@ local function ensure_signal()
                 pcall(cb, job_id, state_str, meta)
             end
         end)
-    end, "State")
+    end, "StateChanged")
     _connected = true
 end
 
@@ -117,21 +117,25 @@ end
 local Job = {}
 Job.__index = Job
 
-Job.start = a.wrap(function(self, cb)
-    get_proxy():StartAsync(function(_, _, _, _) cb() end, nil, self.id)
-end, 2)
-
-Job.progress = a.wrap(function(self, current, total, cb)
-    get_proxy():ProgressAsync(function(_, _, _, _) cb() end, nil, self.id, current, total)
-end, 4)
-
-Job.stage = a.wrap(function(self, name, cb)
-    get_proxy():StageAsync(function(_, _, _, _) cb() end, nil, self.id, name)
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
+Job.start = a.wrap(function(self, metadata, cb)
+    get_proxy():StartAsync(function(_, _, _, _) cb() end, nil, self.id, make_metadata(metadata))
 end, 3)
 
---- @param value string|number|boolean|nil  finish value matched against config colors
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
+Job.progress = a.wrap(function(self, current, total, metadata, cb)
+    get_proxy():ProgressAsync(function(_, _, _, _) cb() end, nil, self.id, current, total, make_metadata(metadata))
+end, 5)
+
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
+Job.stage = a.wrap(function(self, name, metadata, cb)
+    get_proxy():StageAsync(function(_, _, _, _) cb() end, nil, self.id, name, make_metadata(metadata))
+end, 4)
+
+--- @param value string|number|boolean|nil  finish status matched against config colors
 --- @param timeout_ms integer?  ms after which the slot auto-clears; -1 (default) waits for key press
-Job.finish = a.wrap(function(self, value, timeout_ms, cb)
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
+Job.finish = a.wrap(function(self, value, timeout_ms, metadata, cb)
     local tv = type(value)
     local v
     if tv == "number" then
@@ -143,8 +147,8 @@ Job.finish = a.wrap(function(self, value, timeout_ms, cb)
     else
         v = GLib.Variant("b", true)
     end
-    get_proxy():FinishAsync(function(_, _, _, _) cb() end, nil, self.id, v, timeout_ms or -1)
-end, 4)
+    get_proxy():FinishAsync(function(_, _, _, _) cb() end, nil, self.id, v, timeout_ms or -1, make_metadata(metadata))
+end, 5)
 
 Job.get_state = a.wrap(function(self, cb)
     local p = get_proxy()
@@ -155,15 +159,35 @@ Job.get_state = a.wrap(function(self, cb)
     end, nil, self.id)
 end, 2)
 
+--- Read the job's creation metadata (including any later updates via metadata()).
+--- @return table<string, any>?  metadata map, or nil on error
+Job.get_metadata = a.wrap(function(self, cb)
+    local p = get_proxy()
+    if not p then return cb(nil) end
+    p:GetMetadataAsync(function(_, _, result, err)
+        if err or not result then return cb(nil) end
+        cb(strip_meta(result))
+    end, nil, self.id)
+end, 2)
+
+--- Merge key-value pairs into the job's creation metadata.
+--- Existing keys are overwritten; keys not in `updates` are preserved.
+--- Emits the MetadataChanged signal with the full metadata after merging.
+--- @param updates table<string, string|number|boolean>  key-value pairs to merge
+Job.set_metadata = a.wrap(function(self, updates, cb)
+    get_proxy():SetMetadataAsync(function(_, _, _, _) cb() end, nil, self.id, make_metadata(updates))
+end, 3)
+
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or
 --- holds (reject) the key. Async — call from within a plenary.async context
 --- (a.void / a.run) and the result is returned directly (no callback needed).
 ---
 --- The DBus Prompt() call returns immediately. The result arrives via the
 --- State signal with state="prompt_resolved" and metadata.accepted=bool.
---- @param text string  prompt text (stored as metadata, visible via signals)
+--- @param question string  prompt question (stored as metadata, visible via signals)
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
 --- @return boolean  true if the user accepted (tap), false if rejected (hold)
-Job.prompt = a.wrap(function(self, text, cb)
+Job.prompt = a.wrap(function(self, question, metadata, cb)
     local job_id = self.id
 
     -- Register a one-shot listener on the State signal for this job_id.
@@ -183,15 +207,16 @@ Job.prompt = a.wrap(function(self, text, cb)
     ensure_signal()
 
     -- Fire-and-forget: Prompt() returns () now, no result to wait for.
-    get_proxy():PromptAsync(function(_, _, _, _) end, nil, job_id, text)
-end, 3)
+    get_proxy():PromptAsync(function(_, _, _, _) end, nil, job_id, question, make_metadata(metadata))
+end, 4)
 
 --- Resolve a pending prompt externally without keyboard input.
 --- Safe to call even if the prompt was already resolved by the keyboard (no-op).
 --- @param accepted boolean  true to accept, false to reject
-Job.prompt_resolve = a.wrap(function(self, accepted, cb)
-    get_proxy():PromptResolveAsync(function(_, _, _, _) cb() end, nil, self.id, accepted == true)
-end, 3)
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata for signal listeners
+Job.prompt_resolve = a.wrap(function(self, accepted, metadata, cb)
+    get_proxy():PromptResolveAsync(function(_, _, _, _) cb() end, nil, self.id, accepted == true, make_metadata(metadata))
+end, 4)
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
@@ -225,6 +250,45 @@ function M.off_state(callback)
     for i, cb in ipairs(_callbacks) do
         if cb == callback then
             table.remove(_callbacks, i)
+            return
+        end
+    end
+end
+
+-- ── MetadataChanged signal ────────────────────────────────────────────────────
+
+local _metadata_callbacks = {}
+local _metadata_connected = false
+
+local function ensure_metadata_signal()
+    if _metadata_connected then return end
+    local p = get_proxy()
+    if not p then return end
+    p:connect_signal(function(_, job_id, raw_meta)
+        local meta = strip_meta(raw_meta)
+        vim.schedule(function()
+            for _, cb in ipairs(_metadata_callbacks) do
+                pcall(cb, job_id, meta)
+            end
+        end)
+    end, "MetadataChanged")
+    _metadata_connected = true
+end
+
+--- Subscribe to metadata changes for all jobs.
+--- @param callback fun(job_id: number, metadata: table)
+function M.on_metadata(callback)
+    table.insert(_metadata_callbacks, callback)
+    ensure_timer()
+    ensure_metadata_signal()
+end
+
+--- Unsubscribe a previously registered metadata callback.
+--- @param callback fun(job_id: number, metadata: table)
+function M.off_metadata(callback)
+    for i, cb in ipairs(_metadata_callbacks) do
+        if cb == callback then
+            table.remove(_metadata_callbacks, i)
             return
         end
     end
