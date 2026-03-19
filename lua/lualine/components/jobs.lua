@@ -16,9 +16,8 @@
 --
 -- Requires the `jobs` module (../jobs/init.lua) on the runtimepath.
 
-local lualine_require = require("lualine_require")
-local component       = lualine_require("lualine.component"):extend()
-local a               = require("plenary.async")
+local component = require("lualine.component"):extend()
+local a         = require("plenary.async")
 
 -- ── Debug logging ────────────────────────────────────────────────────────────
 -- Remove once things work.
