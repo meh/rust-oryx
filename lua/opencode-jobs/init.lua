@@ -40,100 +40,28 @@ end
 
 -- ── metadata helpers ──────────────────────────────────────────────────────────
 
---- Build a flat metadata table from the session.status `status` sub-object.
---- Only includes non-nil scalar fields (message, attempt, next).
---- @param status table?
+--- Recursively flatten a table into dot-separated keys with scalar values.
+--- Nested tables are recursed; array entries use numeric indices (e.g.
+--- "pattern.1", "pattern.2").  Scalars (string, number, boolean) are
+--- preserved as-is.  Other types are silently dropped.
+--- @param t table?
+--- @param prefix string?
 --- @return table<string, string|number|boolean>
-local function status_meta(status)
-    if not status then return {} end
-    local m = {}
-    if status.message ~= nil then m.status_message = tostring(status.message) end
-    if status.attempt ~= nil then m.status_attempt = status.attempt end
-    if status.next    ~= nil then m.status_next    = status.next end
-    return m
-end
-
---- Flatten a message part into a metadata table with dot-notation keys.
---- @param part table
---- @return table<string, string|number|boolean>
-local function part_meta(part)
-    local m = {}
-    if part.type      ~= nil then m.part_type  = tostring(part.type) end
-    if part.id        ~= nil then m.part_id    = tostring(part.id) end
-    if part.sessionID ~= nil then m.sessionID  = tostring(part.sessionID) end
-    if part.messageID ~= nil then m.messageID  = tostring(part.messageID) end
-    if part.callID    ~= nil then m.callID     = tostring(part.callID) end
-    if part.name      ~= nil then m.part_name  = tostring(part.name) end
-    if part.synthetic ~= nil then m.synthetic  = part.synthetic end
-
-    -- Tool info (may be a string or a table with .name).
-    local tool = part.tool
-    if type(tool) == "table" then
-        if tool.name ~= nil then m.tool_name = tostring(tool.name) end
-    elseif type(tool) == "string" then
-        m.tool_name = tool
+local function flatten(t, prefix)
+    local out = {}
+    if type(t) ~= "table" then return out end
+    for k, v in pairs(t) do
+        local key = prefix and (prefix .. "." .. tostring(k)) or tostring(k)
+        local tv = type(v)
+        if tv == "table" then
+            for fk, fv in pairs(flatten(v, key)) do
+                out[fk] = fv
+            end
+        elseif tv == "string" or tv == "number" or tv == "boolean" then
+            out[key] = v
+        end
     end
-
-    -- State sub-object.
-    local state = part.state
-    if type(state) == "table" then
-        if state.status ~= nil then m.state_status = tostring(state.status) end
-        if state.title  ~= nil then m.state_title  = tostring(state.title) end
-    elseif type(state) == "string" then
-        m.state_status = state
-    end
-
-    return m
-end
-
---- Flatten a permission properties table into metadata.
---- @param props table
---- @return table<string, string|number|boolean>
-local function permission_meta(props)
-    local m = {}
-    if props.id        ~= nil then m.perm_id   = tostring(props.id) end
-    if props.type      ~= nil then m.perm_type  = tostring(props.type) end
-    if props.title     ~= nil then m.perm_title = tostring(props.title) end
-    if props.messageID ~= nil then m.messageID  = tostring(props.messageID) end
-    if props.callID    ~= nil then m.callID     = tostring(props.callID) end
-
-    -- Pattern may be a string or array of strings.
-    local pat = props.pattern
-    if type(pat) == "table" then
-        m.pattern = table.concat(pat, ", ")
-    elseif pat ~= nil then
-        m.pattern = tostring(pat)
-    end
-
-    return m
-end
-
---- Flatten an error table into metadata.
---- Falls back to json-encoding if the error is a table.
---- @param err any
---- @return table<string, string|number|boolean>
-local function error_meta(err)
-    if err == nil then return {} end
-    if type(err) == "string" then
-        return { error = err }
-    elseif type(err) == "table" then
-        local ok, json = pcall(vim.json.encode, err)
-        return { error = ok and json or tostring(err) }
-    else
-        return { error = tostring(err) }
-    end
-end
-
---- Flatten permission.replied properties into metadata.
---- @param props table
---- @return table<string, string|number|boolean>
-local function permission_replied_meta(props)
-    local m = {}
-    if props.sessionID    ~= nil then m.sessionID    = tostring(props.sessionID) end
-    if props.permissionID ~= nil then m.permissionID = tostring(props.permissionID) end
-    if props.requestID    ~= nil then m.requestID    = tostring(props.requestID) end
-    if props.response     ~= nil then m.response     = tostring(props.response) end
-    return m
+    return out
 end
 
 -- ── internals ─────────────────────────────────────────────────────────────────
@@ -202,7 +130,7 @@ function M.setup()
             local sid = props.sessionID
             if not sid then return end
             local status_type = props.status and props.status.type
-            local meta = status_meta(props.status)
+            local meta = flatten(props.status)
             if status_type == "busy" then
                 get_or_create(sid, meta)
             elseif status_type == "idle" then
@@ -233,13 +161,13 @@ function M.setup()
             local entry = active[sid]
             if not entry or not entry.job then return end
 
-            local meta = part_meta(part)
+            local meta = flatten(part)
             local part_type = part.type or "unknown"
 
             -- Derive a human-readable stage name.
             local stage_name
             if part_type == "tool" then
-                stage_name = meta.tool_name or meta.part_name or "tool"
+                stage_name = meta["tool.name"] or meta.name or "tool"
             else
                 stage_name = part_type
             end
@@ -285,7 +213,7 @@ function M.setup()
             local props = event.properties or {}
             local sid = props.sessionID
             if not sid then return end
-            local meta = error_meta(props.error)
+            local meta = flatten({ error = props.error })
             finish_session(sid, 1, FINISH_ERR_TIMEOUT_MS, "error → finish", meta)
         end),
     })
@@ -329,8 +257,8 @@ function M.setup()
         pattern = "OpencodeEvent:file.edited",
         callback = a.void(function(args)
             local event = args.data and args.data.event
-            local file = event and event.properties and event.properties.file
-            local meta = file and { file = tostring(file) } or {}
+            local props = event and event.properties or {}
+            local meta = flatten(props)
             for sid, entry in pairs(active) do
                 if entry.job then
                     entry.job:stage("edit", meta)
@@ -360,7 +288,7 @@ function M.setup()
 
             local perm_id = props.id
             local title   = props.title or "permission"
-            local meta    = permission_meta(props)
+            local meta    = flatten(props)
 
             -- Build a one-shot resolver keyed by permission ID: whichever path
             -- fires first (keyboard or Neovim UI) wins; subsequent calls are no-ops.
@@ -420,7 +348,7 @@ function M.setup()
             local resolver = perm_id and entry.pending_permissions[perm_id]
             if not resolver then return end
 
-            local meta     = permission_replied_meta(props)
+            local meta     = flatten(props)
             local response = props.response or "reject"
             local accepted = response ~= "reject"
             log("session " .. sid_short(sid) .. ": permission.replied (" .. response .. ")")

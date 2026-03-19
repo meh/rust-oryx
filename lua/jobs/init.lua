@@ -82,7 +82,13 @@ local function make_metadata(t)
         if tv == "string" then
             entries[k] = GLib.Variant("s", v)
         elseif tv == "number" then
-            entries[k] = GLib.Variant(v ~= math.floor(v) and "d" or "i", v)
+            if v ~= math.floor(v) then
+                entries[k] = GLib.Variant("d", v)
+            elseif v < -2147483648 or v > 2147483647 then
+                entries[k] = GLib.Variant("x", v)
+            else
+                entries[k] = GLib.Variant("i", v)
+            end
         elseif tv == "boolean" then
             entries[k] = GLib.Variant("b", v)
         end
