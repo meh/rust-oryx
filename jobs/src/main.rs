@@ -1183,33 +1183,69 @@ impl Jobs {
         Ok(())
     }
 
-    async fn get_state(
+    /// Return the full state and metadata for a single job.
+    /// Returns (state_name, state_metadata, job_metadata).
+    async fn get_job(
         &self,
         job_id: u32,
-    ) -> zbus::fdo::Result<(String, HashMap<String, OwnedValue>)> {
+    ) -> zbus::fdo::Result<(
+        String,
+        HashMap<String, OwnedValue>,
+        HashMap<String, OwnedValue>,
+    )> {
         let st = self.state.lock().await;
         let job_state = st
             .get_state(job_id)
             .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
-        let (state_str, meta) = state_to_signal(Some(job_state));
-        Ok((state_str.to_string(), meta))
+        let (state_str, state_meta) = state_to_signal(Some(job_state));
+        let job_meta = st
+            .get_metadata(job_id)
+            .expect("job exists so metadata must exist")
+            .clone();
+        Ok((state_str.to_string(), state_meta, job_meta))
     }
 
-    /// Return the metadata map that was supplied when this job was created
-    /// (including any later updates via `Metadata()`).
-    /// Available for the full lifetime of the job, regardless of current state.
-    async fn get_metadata(&self, job_id: u32) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+    /// Return all active jobs as a map from job_id to
+    /// (state_name, state_metadata, job_metadata).
+    async fn get_jobs(
+        &self,
+    ) -> zbus::fdo::Result<
+        HashMap<
+            u32,
+            (
+                String,
+                HashMap<String, OwnedValue>,
+                HashMap<String, OwnedValue>,
+            ),
+        >,
+    > {
         let st = self.state.lock().await;
-        let meta = st
-            .get_metadata(job_id)
-            .ok_or_else(|| zbus::fdo::Error::Failed(format!("unknown job {job_id}")))?;
-        Ok(meta.clone())
+        let mut result = HashMap::new();
+        for slot in &st.slots {
+            if let (Some(job_id), Some(state)) = (slot.job_id, slot.state.as_ref()) {
+                let (state_str, state_meta) = state_to_signal(Some(state));
+                result.insert(
+                    job_id,
+                    (state_str.to_string(), state_meta, slot.metadata.clone()),
+                );
+            }
+        }
+        for (&job_id, vj) in &st.virtual_jobs {
+            if let Some(state) = vj.state.as_ref() {
+                let (state_str, state_meta) = state_to_signal(Some(state));
+                result.insert(
+                    job_id,
+                    (state_str.to_string(), state_meta, vj.metadata.clone()),
+                );
+            }
+        }
+        Ok(result)
     }
 
     /// Merge key-value pairs into the job's creation metadata.
     /// Existing keys are overwritten; keys not in `updates` are preserved.
     /// Emits the `MetadataChanged` signal with the full metadata after merging.
-    async fn set_metadata(
+    async fn update_job(
         &self,
         job_id: u32,
         updates: HashMap<String, OwnedValue>,

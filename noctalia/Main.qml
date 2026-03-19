@@ -490,7 +490,87 @@ Item {
         }
     }
 
-    Component.onCompleted: fetchDaemonColors()
+    // ── Fetch existing jobs on startup ────────────────────────────────────────
+
+    function fetchJobs() {
+        getJobsProcess.exec([
+            "busctl", "--user", "--json=short", "call",
+            "zsa.oryx.Jobs", "/zsa/oryx/Jobs", "zsa.oryx.Jobs",
+            "GetJobs"
+        ]);
+    }
+
+    /// Parse the GetJobs response and merge into the jobs model.
+    /// Only adds jobs that the monitor hasn't already delivered (monitor wins).
+    function parseGetJobsResponse(line) {
+        var msg;
+        try { msg = JSON.parse(line); } catch (e) { return; }
+
+        var payload = msg;
+        if (msg.payload) payload = msg.payload;
+        if (!payload || !payload.data) return;
+
+        var outer = payload.data;
+        if (Array.isArray(outer) && outer.length >= 1)
+            outer = outer[0];
+        if (!outer || typeof outer !== "object") return;
+
+        var merged = Object.assign({}, jobs);
+        var ids = Object.keys(outer);
+        for (var i = 0; i < ids.length; i++) {
+            var jobId = ids[i];
+
+            // Monitor signals win — skip jobs we already know about.
+            if (merged[jobId] !== undefined) continue;
+
+            var tuple = outer[jobId];
+            if (!Array.isArray(tuple) || tuple.length < 3) continue;
+
+            var state     = tuple[0];
+            var stateDict = parseSvDict(tuple[1]);
+            var jobDict   = parseSvDict(tuple[2]);
+
+            var job = {
+                state: state,
+                creationMetadata: jobDict,
+                stateMetadata: {},
+                metadata: {},
+                current: 0,
+                total: 0,
+                stageName: "",
+                promptText: "",
+                finishedValue: null
+            };
+
+            // Extract state-specific fields (same logic as parseSignalLine).
+            if (state === "progress") {
+                job.current = stateDict.current !== undefined ? parseInt(stateDict.current) : 0;
+                job.total   = stateDict.total   !== undefined ? parseInt(stateDict.total)   : 0;
+            } else if (state === "stage") {
+                job.stageName = stateDict.name || "";
+            } else if (state === "prompt") {
+                job.promptText = stateDict.question || "";
+                showPromptOverlay(parseInt(jobId), job.promptText);
+            } else if (state === "finished") {
+                job.finishedValue = stateDict.status !== undefined ? stateDict.status : null;
+            }
+
+            job.stateMetadata = extractStateMetadata(state, stateDict);
+            job.metadata = Object.assign({}, job.creationMetadata, job.stateMetadata);
+
+            merged[jobId] = job;
+        }
+        jobs = merged;
+    }
+
+    Process {
+        id: getJobsProcess
+        stdout: SplitParser {
+            onRead: line => root.parseGetJobsResponse(line)
+        }
+    }
+
+    Component.onCompleted: { fetchDaemonColors(); fetchJobs(); }
 
     // ── busctl monitor process ────────────────────────────────────────────────
 
@@ -516,6 +596,7 @@ Item {
         onTriggered: {
             monitorProcess.running = true;
             root.fetchDaemonColors();
+            root.fetchJobs();
         }
     }
 

@@ -187,23 +187,10 @@ Item {
 
                     NButton {
                         id: rejectBtn
-                        readonly property string rawColor: mainRef
-                            ? mainRef.ensureContrast(
-                                mainRef.colorSpec("colorPromptReject").color,
-                                Color.mSurface)
-                            : "#CC0000"
                         text: "Reject"
                         fontSize: Style.fontSizeS
-                        backgroundColor: rawColor
-                        textColor: mainRef
-                            ? mainRef.contrastTextColor(rawColor)
-                            : "#FFFFFF"
-                        hoverColor: mainRef
-                            ? mainRef.hoverVariant(rawColor)
-                            : Qt.darker(rawColor, 1.3)
-                        textHoverColor: mainRef
-                            ? mainRef.contrastTextColor(mainRef.hoverVariant(rawColor))
-                            : "#FFFFFF"
+                        backgroundColor: Color.mError
+                        textColor: Color.mOnError
                         implicitHeight: 28 * Style.uiScaleRatio
                         onClicked: {
                             if (mainRef) {
@@ -215,23 +202,8 @@ Item {
 
                     NButton {
                         id: acceptBtn
-                        readonly property string rawColor: mainRef
-                            ? mainRef.ensureContrast(
-                                mainRef.colorSpec("colorPromptAccept").color,
-                                Color.mSurface)
-                            : "#007A00"
                         text: "Accept"
                         fontSize: Style.fontSizeS
-                        backgroundColor: rawColor
-                        textColor: mainRef
-                            ? mainRef.contrastTextColor(rawColor)
-                            : "#FFFFFF"
-                        hoverColor: mainRef
-                            ? mainRef.hoverVariant(rawColor)
-                            : Qt.darker(rawColor, 1.3)
-                        textHoverColor: mainRef
-                            ? mainRef.contrastTextColor(mainRef.hoverVariant(rawColor))
-                            : "#FFFFFF"
                         implicitHeight: 28 * Style.uiScaleRatio
                         onClicked: {
                             if (mainRef) {

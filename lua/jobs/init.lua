@@ -156,23 +156,18 @@ Job.finish = a.wrap(function(self, value, timeout_ms, metadata, cb)
     get_proxy():FinishAsync(function(_, _, _, _) cb() end, nil, self.id, v, timeout_ms or -1, make_metadata(metadata))
 end, 5)
 
-Job.get_state = a.wrap(function(self, cb)
+--- Return the job's current state and metadata.
+--- @return table?  { state: string, state_metadata: table, metadata: table }, or nil on error
+Job.get = a.wrap(function(self, cb)
     local p = get_proxy()
     if not p then return cb(nil) end
-    p:GetStateAsync(function(_, _, result, err)
+    p:GetJobAsync(function(_, _, result, err)
         if err or not result then return cb(nil) end
-        cb({ state = result[1], metadata = strip_meta(result[2]) })
-    end, nil, self.id)
-end, 2)
-
---- Read the job's creation metadata (including any later updates via metadata()).
---- @return table<string, any>?  metadata map, or nil on error
-Job.get_metadata = a.wrap(function(self, cb)
-    local p = get_proxy()
-    if not p then return cb(nil) end
-    p:GetMetadataAsync(function(_, _, result, err)
-        if err or not result then return cb(nil) end
-        cb(strip_meta(result))
+        cb({
+            state = result[1],
+            state_metadata = strip_meta(result[2]),
+            metadata = strip_meta(result[3]),
+        })
     end, nil, self.id)
 end, 2)
 
@@ -180,8 +175,8 @@ end, 2)
 --- Existing keys are overwritten; keys not in `updates` are preserved.
 --- Emits the MetadataChanged signal with the full metadata after merging.
 --- @param updates table<string, string|number|boolean>  key-value pairs to merge
-Job.set_metadata = a.wrap(function(self, updates, cb)
-    get_proxy():SetMetadataAsync(function(_, _, _, _) cb() end, nil, self.id, make_metadata(updates))
+Job.update = a.wrap(function(self, updates, cb)
+    get_proxy():UpdateJobAsync(function(_, _, _, _) cb() end, nil, self.id, make_metadata(updates))
 end, 3)
 
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or
@@ -241,6 +236,25 @@ M.create = a.wrap(function(metadata, slot, timeout_ms, cb)
         cb(setmetatable({ id = id }, Job))
     end, nil, make_metadata(metadata), slot or -1, timeout_ms or -1)
 end, 4)
+
+--- Return all active jobs.
+--- @return table<number, table>?  map from job_id to { state, state_metadata, metadata }, or nil
+M.get_jobs = a.wrap(function(cb)
+    local p = get_proxy()
+    if not p then return cb(nil) end
+    p:GetJobsAsync(function(_, _, result, err)
+        if err or not result then return cb(nil) end
+        local out = {}
+        for id, tuple in pairs(result) do
+            out[id] = {
+                state = tuple[1],
+                state_metadata = strip_meta(tuple[2]),
+                metadata = strip_meta(tuple[3]),
+            }
+        end
+        cb(out)
+    end, nil)
+end, 1)
 
 --- Subscribe to state changes for all jobs.
 --- @param callback fun(job_id: number, state: string, metadata: table)
