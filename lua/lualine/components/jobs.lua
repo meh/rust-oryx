@@ -48,7 +48,7 @@ local PROGRESS_ICONS = {
     "\u{f0aa2}", "\u{f0aa3}", "\u{f0aa4}", "\u{f0aa5}",
 }
 
--- ── Default color specs (matching noctalia manifest.json) ────────────────────
+-- ── Default color specs (hardcoded fallback, matching noctalia manifest.json) ─
 
 local DEFAULT_SPECS = {
     idle           = { type = "static",  color = "#555555" },
@@ -63,9 +63,26 @@ local DEFAULT_SPECS = {
     finished       = { type = "static",  color = "#B4B4B4" },
 }
 
+-- Map daemon GetColors keys to our internal spec keys.
+local DAEMON_KEY_MAP = {
+    ["idle"]             = "idle",
+    ["started"]          = "started",
+    ["progress-start"]   = "progress_start",
+    ["progress-end"]     = "progress_end",
+    ["stage-default"]    = "stage",
+    ["prompt-waiting"]   = "prompt",
+    ["prompt-accept"]    = "prompt_accept",
+    ["prompt-reject"]    = "prompt_reject",
+    ["finished-default"] = "finished",
+}
+
+-- Daemon color specs fetched via GetColors, mapped to our internal keys.
+-- Populated asynchronously on startup.  nil until fetched.
+local daemon_specs = nil
+
 -- Map job state to the spec key used for color resolution.
 local STATE_SPEC_KEY = {
-    created  = "created",
+    created  = "started", -- created uses the same color as started
     started  = "started",
     stage    = "stage",
     prompt   = "prompt",
@@ -156,25 +173,45 @@ local meta_callback  = nil
 -- Active component instances (for triggering refresh)
 local instances = {}
 
--- Highlight namespace
-local HL_PREFIX = "OryxJob_"
-local hl_created = {} -- track which highlight groups exist
-
 -- ── Helpers ──────────────────────────────────────────────────────────────────
 
---- Resolve the color spec for a job state, with user overrides.
+--- Resolve the color spec for a job state.
+--- Fallback chain: user options -> daemon colors -> hardcoded defaults.
+--- Mirrors noctalia's pluginSettings -> daemonColors -> manifest defaults.
 --- @param state string
 --- @param user_specs table?
 --- @return table  color spec { type, color, period_ms? }
 local function spec_for_state(state, user_specs)
     local key = STATE_SPEC_KEY[state]
-    if user_specs and key and user_specs[key] then
+    if not key then return DEFAULT_SPECS.idle end
+
+    -- 1. User overrides (highest priority)
+    if user_specs and user_specs[key] then
         return user_specs[key]
     end
-    if key and DEFAULT_SPECS[key] then
-        return DEFAULT_SPECS[key]
+
+    -- 2. Daemon colors (fetched via GetColors)
+    if daemon_specs and daemon_specs[key] then
+        return daemon_specs[key]
     end
-    return DEFAULT_SPECS.idle
+
+    -- 3. Hardcoded defaults
+    return DEFAULT_SPECS[key] or DEFAULT_SPECS.idle
+end
+
+--- Resolve a spec by key directly (for progress_start/end, prompt_accept/reject, idle).
+--- Same three-level fallback chain.
+--- @param key string
+--- @param user_specs table?
+--- @return table
+local function spec_for_key(key, user_specs)
+    if user_specs and user_specs[key] then
+        return user_specs[key]
+    end
+    if daemon_specs and daemon_specs[key] then
+        return daemon_specs[key]
+    end
+    return DEFAULT_SPECS[key] or DEFAULT_SPECS.idle
 end
 
 --- Check whether any cached job has an animated color spec.
@@ -201,21 +238,18 @@ local function resolve_color(info, user_specs)
         local total = tonumber(sm.total) or 0
         local current = tonumber(sm.current) or 0
         local t = total > 0 and math.max(0, math.min(1, current / total)) or 0
-        local start_spec = (user_specs and user_specs.progress_start) or DEFAULT_SPECS.progress_start
-        local end_spec   = (user_specs and user_specs.progress_end)   or DEFAULT_SPECS.progress_end
+        local start_spec = spec_for_key("progress_start", user_specs)
+        local end_spec   = spec_for_key("progress_end", user_specs)
         return lerp_color(start_spec.color, end_spec.color, t)
     end
 
     -- Prompt resolved: brief flash of accept/reject color.
     if state == "prompt_resolved" then
         local sm = info.state_metadata or {}
-        local accepted = sm.accepted
-        if accepted then
-            local spec = (user_specs and user_specs.prompt_accept) or DEFAULT_SPECS.prompt_accept
-            return spec.color
+        if sm.accepted then
+            return spec_for_key("prompt_accept", user_specs).color
         else
-            local spec = (user_specs and user_specs.prompt_reject) or DEFAULT_SPECS.prompt_reject
-            return spec.color
+            return spec_for_key("prompt_reject", user_specs).color
         end
     end
 
@@ -265,26 +299,6 @@ local function resolve_icon(info, user_icons)
     end
 
     return IDLE_ICON
-end
-
---- Create or update a highlight group for a color.
---- Explicitly clears underline/bold/italic so nothing bleeds from the
---- section's default highlight.
---- @param name string  highlight group name (without HL_PREFIX)
---- @param fg string  hex foreground color
-local function set_hl(name, fg)
-    local hl_name = HL_PREFIX .. name
-    vim.api.nvim_set_hl(0, hl_name, {
-        fg = fg,
-        underline = false,
-        undercurl = false,
-        underdouble = false,
-        underdotted = false,
-        strikethrough = false,
-        bold = false,
-        italic = false,
-    })
-    hl_created[hl_name] = true
 end
 
 -- ── Animation timer ──────────────────────────────────────────────────────────
@@ -369,8 +383,25 @@ local function subscribe(user_specs)
     subscribed = true
     log("subscribe: signals connected")
 
-    -- Seed the cache with any jobs that already exist.
+    -- Seed the cache and fetch daemon colors.
     a.void(function()
+        -- Fetch daemon color config (like noctalia's fetchDaemonColors).
+        log("subscribe: fetching daemon colors via get_colors()")
+        local colors = jobs.get_colors()
+        if colors then
+            daemon_specs = {}
+            for daemon_key, spec in pairs(colors) do
+                local our_key = DAEMON_KEY_MAP[daemon_key]
+                if our_key then
+                    daemon_specs[our_key] = spec
+                end
+            end
+            log("subscribe: daemon colors loaded (" .. vim.tbl_count(daemon_specs) .. " specs)")
+        else
+            log("subscribe: get_colors() returned nil (using defaults)")
+        end
+
+        -- Seed job cache.
         log("subscribe: seeding cache via get_jobs()")
         local all = jobs.get_jobs()
         if all then
@@ -392,6 +423,26 @@ end
 
 -- ── Lualine component ────────────────────────────────────────────────────────
 
+-- We use lualine's create_hl / format_hl API so that highlight groups
+-- properly inherit the section's background and clear decorations like
+-- underline.  Each "slot" (idle, plus up to N concurrent jobs) gets a
+-- highlight created with a dynamic color function that returns the current
+-- animated fg color on every render.
+
+-- Per-slot color: set by update_status, read by the color function closure.
+-- Indexed by slot name (string).
+local slot_colors = {}
+
+--- Build a lualine highlight for a named slot whose fg changes every frame.
+--- @param self_ table  component instance (for create_hl / format_hl)
+--- @param slot string  unique slot name
+local function ensure_slot_hl(self_, slot)
+    if self_._slot_hls[slot] then return end
+    self_._slot_hls[slot] = self_:create_hl(function()
+        return { fg = slot_colors[slot] or "#888888" }
+    end, "job_" .. slot)
+end
+
 function component:init(options)
     component.super.init(self, options)
     log("init: options=" .. vim.inspect(options))
@@ -400,17 +451,18 @@ function component:init(options)
     self.user_icons  = options.icons  or {}
     self.show_empty  = options.show_empty ~= false -- default true
     self.icon_sep    = options.separator or " "
+    self._slot_hls   = {} -- slot_name -> hl token from create_hl
 
     log("init: show_empty=" .. tostring(self.show_empty))
     instances[self] = true
     subscribe(self.user_specs)
 
-    -- Recreate highlight groups on colorscheme change (they get wiped).
+    -- Recreate slot highlights on colorscheme change (they get wiped).
     self._augroup = vim.api.nvim_create_augroup("OryxJobsLualine_" .. tostring(self):sub(-8), { clear = true })
     vim.api.nvim_create_autocmd("ColorScheme", {
         group = self._augroup,
         callback = function()
-            hl_created = {}
+            self._slot_hls = {}
             schedule_refresh()
         end,
     })
@@ -440,9 +492,11 @@ function component:update_status()
     -- No active jobs: show idle icon or nothing.
     if #jobs_list == 0 then
         if self.show_empty then
-            local idle_spec = self.user_specs.idle or DEFAULT_SPECS.idle
-            set_hl("idle", idle_spec.color)
-            local result = "%#" .. HL_PREFIX .. "idle#" .. IDLE_ICON
+            local idle_spec = spec_for_key("idle", self.user_specs)
+            slot_colors["idle"] = idle_spec.color
+            ensure_slot_hl(self, "idle")
+            local hl = self:format_hl(self._slot_hls["idle"])
+            local result = hl .. IDLE_ICON
             if _update_count <= 3 then
                 log("update_status: returning idle: " .. result)
             end
@@ -457,10 +511,12 @@ function component:update_status()
         local color = resolve_color(info, self.user_specs)
         local icon  = resolve_icon(info, self.user_icons)
 
-        -- Use job_id + state as highlight key so each job gets its own group.
-        local hl_key = tostring(entry.id) .. "_" .. info.state
-        set_hl(hl_key, color)
-        parts[#parts + 1] = "%#" .. HL_PREFIX .. hl_key .. "#" .. icon
+        -- Use job_id as the slot key so each job gets its own highlight.
+        local slot = tostring(entry.id)
+        slot_colors[slot] = color
+        ensure_slot_hl(self, slot)
+        local hl = self:format_hl(self._slot_hls[slot])
+        parts[#parts + 1] = hl .. icon
     end
 
     local result = table.concat(parts, self.icon_sep)

@@ -256,6 +256,28 @@ M.get_jobs = a.wrap(function(cb)
     end, nil)
 end, 1)
 
+--- Return the daemon's resolved color configuration.
+--- Each key is a color name (e.g. "started", "stage-default", "prompt-waiting"),
+--- and each value is a table with { type, color, [periodMs] }.
+--- @return table<string, table>?  color specs, or nil on error
+M.get_colors = a.wrap(function(cb)
+    local p = get_proxy()
+    if not p then return cb(nil) end
+    p:GetColorsAsync(function(_, _, result, err)
+        if err or not result then return cb(nil) end
+        local out = {}
+        for name, raw_spec in pairs(result) do
+            local spec = strip_meta(raw_spec)
+            out[name] = {
+                type      = spec.type or "static",
+                color     = spec.color or "#888888",
+                period_ms = spec.periodMs and tonumber(spec.periodMs) or nil,
+            }
+        end
+        cb(out)
+    end, nil)
+end, 1)
+
 --- Subscribe to state changes for all jobs.
 --- @param callback fun(job_id: number, state: string, metadata: table)
 function M.on_state(callback)
