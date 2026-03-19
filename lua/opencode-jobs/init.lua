@@ -64,6 +64,166 @@ local function flatten(t, prefix)
     return out
 end
 
+-- Whitelist of flat keys allowed through for message part metadata.
+local PART_ALLOWED = {
+    -- tool state
+    ["state.status"]                  = true,
+    ["state.title"]                   = true,
+    ["state.error"]                   = true,
+    ["state.time.start"]              = true,
+    ["state.time.end"]                = true,
+    ["state.input.filePath"]          = true,
+    ["state.input.pattern"]           = true,
+    ["state.input.path"]              = true,
+    ["state.input.include"]           = true,
+    ["state.input.description"]       = true,
+    ["state.input.subagent_type"]     = true,
+    ["state.input.url"]               = true,
+    ["state.input.format"]            = true,
+    ["state.metadata.error"]          = true,
+    ["state.metadata.message"]        = true,
+    ["state.metadata.truncated"]      = true,
+    ["state.metadata.count"]          = true,
+    ["state.metadata.matches"]        = true,
+    ["state.metadata.http_status"]    = true,
+    ["state.metadata.content_type"]   = true,
+    ["state.metadata.line_count"]     = true,
+    ["state.metadata.file_type"]      = true,
+    ["state.metadata.exists"]         = true,
+    ["state.metadata.model"]          = true,
+    ["state.metadata.filepath"]       = true,
+    -- text / reasoning
+    ["synthetic"]                     = true,
+    ["time.start"]                    = true,
+    ["time.end"]                      = true,
+    -- file
+    ["filename"]                      = true,
+    ["mime"]                          = true,
+    ["url"]                           = true,
+    -- agent
+    ["name"]                          = true,
+    -- step-start / step-finish
+    ["snapshot"]                      = true,
+    ["reason"]                        = true,
+    ["cost"]                          = true,
+    ["tokens.input"]                  = true,
+    ["tokens.output"]                 = true,
+    ["tokens.reasoning"]              = true,
+    ["tokens.cache.read"]             = true,
+    ["tokens.cache.write"]            = true,
+    -- patch
+    ["hash"]                          = true,
+}
+
+--- Keep only whitelisted keys from a flattened part table.
+--- @param flat table<string, string|number|boolean>
+--- @return table<string, string|number|boolean>
+local function filter_part(flat)
+    local out = {}
+    for k, v in pairs(flat) do
+        if PART_ALLOWED[k] or k:match("^files%.%d+$") then
+            out[k] = v
+        end
+    end
+    return out
+end
+
+--- Rename a key in-place: move old → new if old exists.
+local function rename(t, old, new)
+    if t[old] ~= nil then
+        t[new] = t[old]
+        t[old] = nil
+    end
+end
+
+--- Rename all keys matching a prefix to a new prefix.
+local function rename_prefix(t, old_pfx, new_pfx)
+    local moves = {}
+    for k, v in pairs(t) do
+        if k:sub(1, #old_pfx) == old_pfx then
+            moves[k] = new_pfx .. k:sub(#old_pfx + 1)
+        end
+    end
+    for old, new in pairs(moves) do
+        t[new] = t[old]
+        t[old] = nil
+    end
+end
+
+--- Apply per-type exclusions and renames to filtered part metadata.
+--- @param part_type string
+--- @param meta table<string, string|number|boolean>
+--- @return table<string, string|number|boolean>
+local function transform_part(part_type, meta)
+    if part_type == "tool" then
+        -- Fill filePath from metadata.filepath if missing.
+        if meta["state.input.filePath"] == nil and meta["state.metadata.filepath"] ~= nil then
+            meta["state.input.filePath"] = meta["state.metadata.filepath"]
+        end
+        meta["state.status"]             = nil
+        meta["state.error"]              = nil
+        meta["state.metadata.error"]     = nil
+        meta["state.metadata.truncated"] = nil
+        meta["state.metadata.filepath"]  = nil
+        rename_prefix(meta, "state.", "tool.")
+    elseif part_type == "text" then
+        meta["synthetic"] = nil
+        rename(meta, "time.start", "text.time.start")
+        rename(meta, "time.end",   "text.time.end")
+    elseif part_type == "reasoning" then
+        rename(meta, "time.start", "reasoning.time.start")
+    elseif part_type == "file" then
+        rename(meta, "mime", "file.mime")
+        rename(meta, "url",  "file.url")
+    elseif part_type == "agent" then
+        rename(meta, "name", "agent.name")
+    elseif part_type == "step-start" then
+        rename(meta, "snapshot", "step.snapshot")
+    elseif part_type == "step-finish" then
+        rename(meta, "snapshot", "step.snapshot")
+        rename(meta, "reason",   "step.reason")
+        rename(meta, "cost",     "step.cost")
+    elseif part_type == "patch" then
+        rename(meta, "hash", "patch.hash")
+        rename_prefix(meta, "files.", "patch.files.")
+    end
+    return meta
+end
+
+-- Keys stripped from session info before storing as job metadata.
+local SESSION_STRIP = {
+    ["session.id"]  = true,
+    ["session.projectID"] = true,
+    ["session.parentID"]  = true,
+}
+local SESSION_STRIP_PREFIX = {
+    "session.permission.",
+    "session.revert.",
+    "session.share.",
+}
+
+--- Filter a flattened session table, removing opaque/internal fields.
+--- @param flat table<string, string|number|boolean>
+--- @return table<string, string|number|boolean>
+local function filter_session(flat)
+    local out = {}
+    for k, v in pairs(flat) do
+        if not SESSION_STRIP[k] then
+            local dominated = false
+            for _, pfx in ipairs(SESSION_STRIP_PREFIX) do
+                if k:sub(1, #pfx) == pfx then
+                    dominated = true
+                    break
+                end
+            end
+            if not dominated then
+                out[k] = v
+            end
+        end
+    end
+    return out
+end
+
 -- ── internals ─────────────────────────────────────────────────────────────────
 
 --- Get or create a job for the given session, starting it immediately.
@@ -80,7 +240,7 @@ local function get_or_create(session_id, metadata)
     -- sentinel and bails rather than creating a second job.
     active[session_id] = { job = nil, tool_count = 0, pending_permissions = {} }
 
-    local job = jobs.create({ name = "opencode", session_id = session_id })
+    local job = jobs.create({ name = "opencode", ["session.id"] = session_id })
     if not job then
         active[session_id] = nil
         warn("session " .. sid_short(session_id) .. ": failed to create job (service unavailable?)")
@@ -145,9 +305,32 @@ function M.setup()
         end),
     })
 
+    -- Session updated: persist session info (title, slug, directory, …) as
+    -- job metadata so downstream consumers can display it.
+    vim.api.nvim_create_autocmd("User", {
+        group = augroup,
+        pattern = "OpencodeEvent:session.updated",
+        callback = a.void(function(args)
+            local event = args.data and args.data.event
+            if not event then return end
+            local props = event.properties or {}
+            local info = props.info
+            if not info then return end
+            local sid = info.id
+            if not sid then return end
+            local entry = active[sid]
+            if not entry or not entry.job then return end
+
+            local meta = filter_session(flatten(info, "session"))
+            entry.job:set_metadata(meta)
+            log("session " .. sid_short(sid) .. ": session.updated → set_metadata")
+        end),
+    })
+
     -- Message part updated: show activity for all part types as stages.
     -- Tool parts are ref-counted so the LED returns to "started" only when
     -- every concurrent tool call has completed.
+    -- Metadata is flattened, whitelisted, and transformed per part type.
     vim.api.nvim_create_autocmd("User", {
         group = augroup,
         pattern = "OpencodeEvent:message.part.updated",
@@ -161,16 +344,21 @@ function M.setup()
             local entry = active[sid]
             if not entry or not entry.job then return end
 
-            local meta = flatten(part)
             local part_type = part.type or "unknown"
 
-            -- Derive a human-readable stage name.
+            -- Derive a human-readable stage name before filtering.
             local stage_name
             if part_type == "tool" then
-                stage_name = meta["tool.name"] or meta.name or "tool"
+                local tool = part.tool
+                stage_name = (type(tool) == "string" and tool)
+                          or (type(tool) == "table" and tool.name)
+                          or part.name or "tool"
             else
                 stage_name = part_type
             end
+
+            local flat = flatten(part)
+            local meta = transform_part(part_type, filter_part(flat))
 
             local state = part.state
             local status = state and (type(state) == "table" and state.status or state)
