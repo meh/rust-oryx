@@ -268,11 +268,22 @@ local function resolve_icon(info, user_icons)
 end
 
 --- Create or update a highlight group for a color.
+--- Explicitly clears underline/bold/italic so nothing bleeds from the
+--- section's default highlight.
 --- @param name string  highlight group name (without HL_PREFIX)
 --- @param fg string  hex foreground color
 local function set_hl(name, fg)
     local hl_name = HL_PREFIX .. name
-    vim.api.nvim_set_hl(0, hl_name, { fg = fg })
+    vim.api.nvim_set_hl(0, hl_name, {
+        fg = fg,
+        underline = false,
+        undercurl = false,
+        underdouble = false,
+        underdotted = false,
+        strikethrough = false,
+        bold = false,
+        italic = false,
+    })
     hl_created[hl_name] = true
 end
 
