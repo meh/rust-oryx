@@ -198,6 +198,11 @@ enum JobState {
     },
     Stage(String),
     Prompt(String),
+    /// Transient state emitted only as a signal when a prompt resolves.
+    /// Never stored on a slot — the slot transitions directly to Started.
+    PromptResolved {
+        accepted: bool,
+    },
     Finished(OwnedValue),
 }
 
@@ -493,6 +498,11 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
             };
             LedAction::Animate(spec)
         }
+        // PromptResolved is transient — never stored on a slot, but handle
+        // it defensively by treating it the same as Started.
+        Some(JobState::PromptResolved { .. }) => {
+            color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
+        }
         Some(JobState::Finished(v)) => {
             let cs = colors
                 .finished
@@ -536,6 +546,10 @@ fn state_to_signal(state: Option<&JobState>) -> (&'static str, HashMap<String, O
                 OwnedValue::from(zbus::zvariant::Str::from(text.as_str())),
             )]
             .into(),
+        ),
+        Some(JobState::PromptResolved { accepted }) => (
+            "prompt_resolved",
+            [("accepted".to_string(), OwnedValue::from(*accepted))].into(),
         ),
         Some(JobState::Finished(value)) => {
             ("finished", [("value".to_string(), value.clone())].into())
@@ -696,7 +710,11 @@ impl Jobs {
     /// Enter prompt state: LED animates (default: breathe) until the user taps
     /// (accept → true) or holds (reject → false) the slot key, or until
     /// `PromptResolve` is called externally.
-    async fn prompt(&self, job_id: u32, text: String) -> zbus::fdo::Result<bool> {
+    ///
+    /// Returns immediately. The result is delivered asynchronously via the
+    /// `State` signal with state `"prompt_resolved"` and metadata
+    /// `{ accepted: bool }`.
+    async fn prompt(&self, job_id: u32, text: String) -> zbus::fdo::Result<()> {
         let (tx, rx) = oneshot::channel();
 
         let led = {
@@ -733,75 +751,93 @@ impl Jobs {
             led
         };
 
-        // Block until the user responds — returns immediately if pre-resolved above.
-        let result = rx.await;
+        // Spawn a background task that waits for the oneshot to resolve and
+        // then emits the result as a State signal. This avoids blocking the
+        // DBus method call (which would time out under GLib's default timeout).
+        let cmd_tx = self.cmd_tx.clone();
+        let status_tx = self.status_tx.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let accepted = match rx.await {
+                Ok(v) => v,
+                Err(_) => {
+                    // Oneshot dropped without sending — job was cleared while
+                    // the prompt was pending. Nothing to signal.
+                    warn!(job_id, "prompt: cancelled (channel dropped)");
+                    state.lock().await.prompt_done.notify_waiters();
+                    return;
+                }
+            };
 
-        // Always stop animation regardless of how the prompt resolved.
-        let _ = self.cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
+            // Stop animation.
+            let _ = cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
 
-        // Wake any callers that were blocked waiting for this prompt to finish.
-        self.state.lock().await.prompt_done.notify_waiters();
+            // Emit the prompt_resolved signal so Lua callers get the result.
+            let _ = status_tx
+                .send((job_id, Some(JobState::PromptResolved { accepted })))
+                .await;
 
-        let accepted = result.map_err(|_| {
-            zbus::fdo::Error::Failed("prompt cancelled (channel dropped)".to_string())
-        })?;
+            // Wake any callers that were blocked waiting for this prompt to finish.
+            state.lock().await.prompt_done.notify_waiters();
 
-        info!(job_id, accepted, "prompt: resolved");
-        Ok(accepted)
+            info!(job_id, accepted, "prompt: resolved");
+        });
+
+        Ok(())
     }
 
     /// Resolve a pending prompt externally (e.g. from Neovim's UI) without
-    /// requiring physical keyboard input. Unblocks the waiting `Prompt()` call,
-    /// stops the breathing animation, and triggers the accept/reject pulse.
+    /// requiring physical keyboard input. Sends the answer through the oneshot
+    /// channel; the background task spawned by `Prompt()` picks it up, stops
+    /// the animation, emits the `prompt_resolved` signal, and notifies
+    /// `prompt_done`.
     ///
     /// Returns `Ok(())` silently if the prompt was already resolved (race is fine).
     async fn prompt_resolve(&self, job_id: u32, accepted: bool) -> zbus::fdo::Result<()> {
-        let (led, pulse_color) = {
-            let mut st = self.state.lock().await;
+        let mut st = self.state.lock().await;
 
-            if !matches!(st.get_state(job_id), Some(JobState::Prompt(_))) {
-                if st.job_to_slot.contains_key(&job_id) {
-                    // Prompt() hasn't been called yet — store the answer so
-                    // prompt() can consume it immediately without blocking.
-                    debug!(
-                        job_id,
-                        accepted, "PromptResolve arrived before Prompt(); pre-resolving"
-                    );
-                    st.pre_resolved.insert(job_id, accepted);
-                }
-                // Either pre-stored or already fully resolved — either way done.
-                return Ok(());
+        if !matches!(st.get_state(job_id), Some(JobState::Prompt(_))) {
+            if st.job_to_slot.contains_key(&job_id) {
+                // Prompt() hasn't been called yet — store the answer so
+                // prompt() can consume it immediately without blocking.
+                debug!(
+                    job_id,
+                    accepted, "PromptResolve arrived before Prompt(); pre-resolving"
+                );
+                st.pre_resolved.insert(job_id, accepted);
             }
+            // Either pre-stored or already fully resolved — either way done.
+            return Ok(());
+        }
 
-            let tx = match st.take_prompt_responder(job_id) {
-                Some(t) => t,
-                None => return Ok(()), // responder already consumed by keyboard
-            };
-
-            let &slot_i = st.job_to_slot.get(&job_id).unwrap();
-            let led = st.slots[slot_i].led;
-
-            // Transition state back to Started (mirrors the keyboard path).
-            st.slots[slot_i].state = Some(JobState::Started);
-
-            let pulse_color = if accepted {
-                st.colors.prompt.accept.unwrap_or(Rgb(0, 255, 0))
-            } else {
-                st.colors.prompt.reject.unwrap_or(Rgb(255, 0, 0))
-            };
-
-            // Unblock the waiting Prompt() DBus call.
-            let _ = tx.send(accepted);
-
-            st.pre_resolved.remove(&job_id);
-
-            (led, pulse_color)
+        let tx = match st.take_prompt_responder(job_id) {
+            Some(t) => t,
+            None => return Ok(()), // responder already consumed by keyboard
         };
+
+        let &slot_i = st.job_to_slot.get(&job_id).unwrap();
+        let led = st.slots[slot_i].led;
+
+        // Transition state back to Started (mirrors the keyboard path).
+        st.slots[slot_i].state = Some(JobState::Started);
+
+        let pulse_color = if accepted {
+            st.colors.prompt.accept.unwrap_or(Rgb(0, 255, 0))
+        } else {
+            st.colors.prompt.reject.unwrap_or(Rgb(255, 0, 0))
+        };
+
+        // Send accepted/rejected through the oneshot. The background task
+        // spawned by prompt() will pick this up, emit the prompt_resolved
+        // signal, and notify prompt_done.
+        let _ = tx.send(accepted);
+
+        st.pre_resolved.remove(&job_id);
+        drop(st);
 
         info!(job_id, accepted, "prompt resolved via PromptResolve");
 
-        // Stop animation and trigger the pulse in keyboard_task.
-        let _ = self.cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
+        // Trigger the pulse animation in keyboard_task.
         let _ = self
             .cmd_tx
             .send(KbdCmd::Pulse {
@@ -814,9 +850,32 @@ impl Jobs {
             })
             .await;
 
-        // Wake any callers blocked waiting for the prompt to finish.
-        self.state.lock().await.prompt_done.notify_waiters();
+        Ok(())
+    }
 
+    /// Clear a finished job from software (e.g. from a UI widget).
+    /// Only acts when the job is in Finished state; returns Ok(()) silently
+    /// if the job is already gone or not yet finished (idempotent).
+    async fn clear(&self, job_id: u32) -> zbus::fdo::Result<()> {
+        let mut st = self.state.lock().await;
+        if !matches!(st.get_state(job_id), Some(JobState::Finished(_))) {
+            return Ok(());
+        }
+        let led = st
+            .force_clear(job_id)
+            .expect("state was Finished so slot must exist");
+        drop(st);
+        info!(job_id, led, "job cleared via Clear()");
+        let _ = self
+            .cmd_tx
+            .send(KbdCmd::SetRgb {
+                index: led,
+                r: 0,
+                g: 0,
+                b: 0,
+            })
+            .await;
+        let _ = self.status_tx.send((job_id, None)).await;
         Ok(())
     }
 
@@ -896,9 +955,9 @@ struct PulseState {
     b: u8,
     start: Instant,
     count: u8,
+    #[allow(dead_code)]
     accepted: bool,
     job_id: u32,
-    responder: Option<oneshot::Sender<bool>>,
 }
 
 const PULSE_CYCLE_MS: f32 = 166.0; // ~83ms on, ~83ms off
@@ -960,7 +1019,6 @@ async fn keyboard_task(
                             count: 3,
                             accepted,
                             job_id,
-                            responder: None,
                         });
                     }
                 }
@@ -992,7 +1050,12 @@ async fn keyboard_task(
 
                             info!(job_id, accepted, held_ms, hold_ms, "prompt key released");
 
-                            let responder = st.take_prompt_responder(job_id);
+                            // Send accepted/rejected through the oneshot so the
+                            // background task (spawned by prompt()) picks it up
+                            // and emits the prompt_resolved signal.
+                            if let Some(responder) = st.take_prompt_responder(job_id) {
+                                let _ = responder.send(accepted);
+                            }
 
                             // Transition state back to Started (prompt is resolved).
                             let slot_i = *st.job_to_slot.get(&job_id).unwrap();
@@ -1010,7 +1073,6 @@ async fn keyboard_task(
                                 count: 3,
                                 accepted,
                                 job_id,
-                                responder,
                             });
                         } else if let Some((job_id, led)) = st.try_clear(col, row) {
                             info!(job_id, led, "job cleared by key");
@@ -1054,18 +1116,10 @@ async fn keyboard_task(
                 }
 
                 for led in done {
-                    if let Some(mut ps) = pulsing.remove(&led) {
+                    if let Some(ps) = pulsing.remove(&led) {
                         // Turn off the LED after pulse.
                         let _ = kbd.rgb(led, 0, 0, 0).await;
-
-                        // Send response and emit state signal.
-                        if let Some(responder) = ps.responder.take() {
-                            let _ = responder.send(ps.accepted);
-                        }
                         state.lock().await.pre_resolved.remove(&ps.job_id);
-                        let _ = status_tx
-                            .send((ps.job_id, Some(JobState::Started)))
-                            .await;
                     }
                 }
             }

@@ -20,7 +20,7 @@ local FINISH_OK_TIMEOUT_MS    = 3000
 local FINISH_ERR_TIMEOUT_MS   = 5000
 local FINISH_DELETE_TIMEOUT_MS = 2000
 
-local active  = {} -- session_id -> { job = Job, tool_count = number, pending_permission = function? }
+local active  = {} -- session_id -> { job = Job, tool_count = number, pending_permissions = { [perm_id] = function } }
 local augroup = nil
 
 -- ── logging ───────────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ local function get_or_create(session_id)
     -- Reserve the slot immediately before yielding to jobs.create, so that a
     -- second busy event arriving while CreateAsync is in flight sees the
     -- sentinel and bails rather than creating a second job.
-    active[session_id] = { job = nil, tool_count = 0 }
+    active[session_id] = { job = nil, tool_count = 0, pending_permissions = {} }
 
     local job = jobs.create({ name = "opencode", session_id = session_id })
     if not job then
@@ -79,8 +79,8 @@ local function finish_session(session_id, value, timeout_ms, reason)
     else
         warn("session " .. sid_short(session_id) .. ": " .. reason)
     end
-    entry.job:finish(value, timeout_ms)
     active[session_id] = nil
+    entry.job:finish(value, timeout_ms)
 end
 
 -- ── setup / teardown ──────────────────────────────────────────────────────────
@@ -176,6 +176,8 @@ function M.setup()
     -- Permission asked: start a keyboard prompt and wire up a resolve_once
     -- function that whichever path fires first (keyboard or Neovim UI) will
     -- call. Subsequent calls are no-ops, preventing double API calls.
+    -- Each permission is tracked by its unique ID so that concurrent prompts
+    -- (e.g. rapid tool calls) don't overwrite each other's resolvers.
     vim.api.nvim_create_autocmd("User", {
         group = augroup,
         pattern = "OpencodeEvent:permission.asked",
@@ -188,14 +190,16 @@ function M.setup()
             local entry = active[sid]
             if not entry or not entry.job then return end
 
-            local title = props.title or "permission"
+            local perm_id = props.id
+            local title   = props.title or "permission"
 
-            -- Build a one-shot resolver: whichever path fires first wins.
+            -- Build a one-shot resolver keyed by permission ID: whichever path
+            -- fires first (keyboard or Neovim UI) wins; subsequent calls are no-ops.
             local called = false
             local function resolve_once(accepted)
                 if called then return end
                 called = true
-                entry.pending_permission = nil
+                if perm_id then entry.pending_permissions[perm_id] = nil end
 
                 log("session " .. sid_short(sid) .. ": permission → " .. (accepted and "accepted" or "rejected"))
 
@@ -214,7 +218,7 @@ function M.setup()
                 a.void(function() entry.job:prompt_resolve(accepted) end)()
             end
 
-            entry.pending_permission = resolve_once
+            if perm_id then entry.pending_permissions[perm_id] = resolve_once end
 
             log("session " .. sid_short(sid) .. ': prompt "' .. title .. '" — awaiting keyboard or UI')
 
@@ -229,8 +233,8 @@ function M.setup()
     })
 
     -- Permission replied (from server, after UI or keyboard resolved it):
-    -- call resolve_once so that if the UI acted first the keyboard LED is
-    -- updated; if the keyboard acted first this is a harmless no-op.
+    -- look up the resolver by permission ID so concurrent prompts don't
+    -- cross-resolve each other.
     vim.api.nvim_create_autocmd("User", {
         group = augroup,
         pattern = "OpencodeEvent:permission.replied",
@@ -241,12 +245,16 @@ function M.setup()
             local sid = props.sessionID
             if not sid then return end
             local entry = active[sid]
-            if not entry or not entry.pending_permission then return end
+            if not entry then return end
 
-            local response = props.reply or "reject"
+            local perm_id = props.permissionID or props.requestID
+            local resolver = perm_id and entry.pending_permissions[perm_id]
+            if not resolver then return end
+
+            local response = props.response or "reject"
             local accepted = response ~= "reject"
             log("session " .. sid_short(sid) .. ": permission.replied (" .. response .. ")")
-            entry.pending_permission(accepted)
+            resolver(accepted)
         end),
     })
 end

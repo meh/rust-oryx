@@ -158,12 +158,32 @@ end, 2)
 --- Enter prompt state: the slot LED breathes until the user taps (accept) or
 --- holds (reject) the key. Async — call from within a plenary.async context
 --- (a.void / a.run) and the result is returned directly (no callback needed).
+---
+--- The DBus Prompt() call returns immediately. The result arrives via the
+--- State signal with state="prompt_resolved" and metadata.accepted=bool.
 --- @param text string  prompt text (stored as metadata, visible via signals)
 --- @return boolean  true if the user accepted (tap), false if rejected (hold)
 Job.prompt = a.wrap(function(self, text, cb)
-    get_proxy():PromptAsync(function(_, _, result, _)
-        cb(result == true)
-    end, nil, self.id, text)
+    local job_id = self.id
+
+    -- Register a one-shot listener on the State signal for this job_id.
+    local function on_state(sid, state_str, meta)
+        if sid == job_id and state_str == "prompt_resolved" then
+            -- Unsubscribe ourselves immediately.
+            for i, c in ipairs(_callbacks) do
+                if c == on_state then
+                    table.remove(_callbacks, i)
+                    break
+                end
+            end
+            cb(meta.accepted == true)
+        end
+    end
+    table.insert(_callbacks, on_state)
+    ensure_signal()
+
+    -- Fire-and-forget: Prompt() returns () now, no result to wait for.
+    get_proxy():PromptAsync(function(_, _, _, _) end, nil, job_id, text)
 end, 3)
 
 --- Resolve a pending prompt externally without keyboard input.
