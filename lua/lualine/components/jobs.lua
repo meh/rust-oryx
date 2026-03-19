@@ -23,17 +23,20 @@ local a               = require("plenary.async")
 -- ── Nerd Font icons ──────────────────────────────────────────────────────────
 
 local STATE_ICONS = {
-    created  = "󰐕", -- nf-md-plus_circle_outline
-    started  = "", -- nf-fa-play
-    progress = true, -- sentinel: use progress_icons below
-    stage    = "󰆋", -- nf-md-layers
-    prompt   = "", -- nf-fa-question_circle
-    finished = "󰄬", -- nf-md-check_circle_outline
+    created  = "\u{f0415}", -- nf-md-plus_circle_outline
+    started  = "\u{f040a}", -- nf-md-play
+    progress = true,        -- sentinel: use progress_icons below
+    stage    = "\u{f018b}", -- nf-md-layers
+    prompt   = "\u{f059}",  -- nf-fa-question_circle
+    finished = "\u{f0132}", -- nf-md-check_circle_outline
 }
-local IDLE_ICON = "󰝥" -- nf-md-circle_outline
+local IDLE_ICON = "\u{f0765}" -- nf-md-circle_outline
 
 -- Circle-slice glyphs for progress animation (0/8 .. 8/8).
-local PROGRESS_ICONS = { "󰪞", "󰪟", "󰪠", "󰪡", "󰪢", "󰪣", "󰪤", "󰪥" }
+local PROGRESS_ICONS = {
+    "\u{f0a9e}", "\u{f0a9f}", "\u{f0aa0}", "\u{f0aa1}",
+    "\u{f0aa2}", "\u{f0aa3}", "\u{f0aa4}", "\u{f0aa5}",
+}
 
 -- ── Default color specs (matching noctalia manifest.json) ────────────────────
 
@@ -240,9 +243,9 @@ local function resolve_icon(info, user_icons)
     if state == "prompt_resolved" then
         local sm = info.state_metadata or {}
         if sm.accepted then
-            return "󰄬" -- check
+            return "\u{f0132}" -- nf-md-check_circle_outline
         else
-            return "󰅖" -- close/x
+            return "\u{f0156}" -- nf-md-close_circle_outline
         end
     end
 
