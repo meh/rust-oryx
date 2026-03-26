@@ -20,7 +20,7 @@ local FINISH_OK_TIMEOUT_MS    = 3000
 local FINISH_ERR_TIMEOUT_MS   = 5000
 local FINISH_DELETE_TIMEOUT_MS = 2000
 
-local active  = {} -- session_id -> { job = Job, tool_count = number, pending_permissions = { [perm_id] = function } }
+local active  = {} -- session_id -> { job = Job, tool_count = number, pending_permissions = { [perm_id] = function }, pending_questions = { [request_id] = function } }
 local augroup = nil
 
 -- ── logging ───────────────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ local function get_or_create(session_id, metadata)
     -- Reserve the slot immediately before yielding to jobs.create, so that a
     -- second busy event arriving while CreateAsync is in flight sees the
     -- sentinel and bails rather than creating a second job.
-    active[session_id] = { job = nil, tool_count = 0, pending_permissions = {} }
+    active[session_id] = { job = nil, tool_count = 0, pending_permissions = {}, pending_questions = {} }
 
     local job = jobs.create({ name = "opencode", ["session.id"] = session_id })
     if not job then
@@ -322,6 +322,9 @@ function M.setup()
             if not entry or not entry.job then return end
 
             local meta = filter_session(flatten(info, "session"))
+            if info.title and info.title ~= "" then
+                meta.name = info.title
+            end
             entry.job:update(meta)
             log("session " .. sid_short(sid) .. ": session.updated → update")
         end),
@@ -420,7 +423,10 @@ function M.setup()
         end),
     })
 
-    -- Question asked: show as a stage so the LED reflects the pending question.
+    -- Question asked: walk each question sequentially via the keyboard's
+    -- Choice mode, then reply to the opencode server with the selected
+    -- option labels.  If the UI answers first (question.replied /
+    -- question.rejected), the keyboard side is unblocked via choice_resolve.
     vim.api.nvim_create_autocmd("User", {
         group = augroup,
         pattern = "OpencodeEvent:question.asked",
@@ -432,8 +438,150 @@ function M.setup()
             if not sid then return end
             local entry = active[sid]
             if not entry or not entry.job then return end
-            entry.job:stage("question")
-            log("session " .. sid_short(sid) .. ": question.asked → stage")
+
+            local request_id = props.id
+            local questions  = props.questions
+            if not questions or #questions == 0 then return end
+
+            -- Build a one-shot resolver: whichever path fires first
+            -- (keyboard or UI) wins; subsequent calls are no-ops.
+            -- When `from_keyboard` is true, the resolver calls the opencode
+            -- API; when false (UI already answered), it only cleans up state.
+            local called = false
+            local function resolve_once(answers_or_nil, from_keyboard)
+                if called then return end
+                called = true
+                if request_id then entry.pending_questions[request_id] = nil end
+
+                local rejected = answers_or_nil == nil
+                log("session " .. sid_short(sid) .. ": question → " .. (rejected and "rejected" or "replied"))
+
+                -- Only call the opencode API when the keyboard resolved first;
+                -- if the UI answered, the server already has the response.
+                if from_keyboard then
+                    local state_ok, oc_state = pcall(require, "opencode.state")
+                    if not state_ok or not oc_state.api_client then
+                        warn("session " .. sid_short(sid) .. ": question resolved but opencode.state unavailable")
+                        return
+                    end
+                    if rejected then
+                        oc_state.api_client:reject_question(request_id)
+                    else
+                        oc_state.api_client:reply_question(request_id, answers_or_nil)
+                    end
+                end
+            end
+
+            if request_id then entry.pending_questions[request_id] = resolve_once end
+
+            log("session " .. sid_short(sid) .. ": question.asked (" .. #questions .. " questions) — awaiting keyboard or UI")
+
+            -- Walk questions sequentially from the keyboard.
+            a.void(function()
+                local answers = {}
+                for _, q in ipairs(questions) do
+                    if called then return end -- UI already answered/rejected
+
+                    local header  = q.header or "choice"
+                    local options = q.options or {}
+                    if #options == 0 then
+                        -- No options to choose from — skip this question.
+                        table.insert(answers, {})
+                    else
+                        local meta = flatten(q)
+                        -- Embed option labels into metadata so signal consumers
+                        -- can see what the options are.
+                        for i, opt in ipairs(options) do
+                            meta["option." .. i .. ".label"]       = opt.label
+                            meta["option." .. i .. ".description"] = opt.description or ""
+                        end
+
+                        local choice_idx = entry.job:choice(header, #options, meta)
+
+                        if called then return end -- UI may have resolved during choice()
+
+                        if choice_idx == 0 then
+                            -- User rejected this question from the keyboard.
+                            resolve_once(nil, true)
+                            return
+                        end
+
+                        -- Wrap the choice index to the valid range (the daemon
+                        -- already does this, but be defensive).
+                        local idx = ((choice_idx - 1) % #options) + 1
+                        local selected_label = options[idx] and options[idx].label or tostring(idx)
+                        table.insert(answers, { selected_label })
+                    end
+                end
+
+                if not called then
+                    resolve_once(answers, true)
+                end
+            end)()
+        end),
+    })
+
+    -- Question replied (from server, after UI answered it): look up the
+    -- resolver by request ID and resolve the keyboard side.
+    vim.api.nvim_create_autocmd("User", {
+        group = augroup,
+        pattern = "OpencodeEvent:question.replied",
+        callback = a.void(function(args)
+            local event = args.data and args.data.event
+            if not event then return end
+            local props = event.properties or {}
+            local sid = props.sessionID
+            if not sid then return end
+            local entry = active[sid]
+            if not entry then return end
+
+            local req_id   = props.requestID
+            local resolver = req_id and entry.pending_questions[req_id]
+            if not resolver then return end
+
+            local answers = props.answers or {}
+            log("session " .. sid_short(sid) .. ": question.replied (" .. #answers .. " answers)")
+
+            -- Unblock the keyboard side: resolve the current choice prompt.
+            -- We send choice=1 (any non-zero value) to unblock it; the actual
+            -- answer was already sent by the UI so our resolver becomes a no-op.
+            if entry.job then
+                a.void(function() entry.job:choice_resolve(1) end)()
+            end
+
+            -- Call the resolver (no-op if keyboard already resolved).
+            -- Pass false for from_keyboard since the UI already sent the reply.
+            resolver(answers, false)
+        end),
+    })
+
+    -- Question rejected (from server, after UI dismissed it): look up the
+    -- resolver by request ID and reject on the keyboard side.
+    vim.api.nvim_create_autocmd("User", {
+        group = augroup,
+        pattern = "OpencodeEvent:question.rejected",
+        callback = a.void(function(args)
+            local event = args.data and args.data.event
+            if not event then return end
+            local props = event.properties or {}
+            local sid = props.sessionID
+            if not sid then return end
+            local entry = active[sid]
+            if not entry then return end
+
+            local req_id   = props.requestID
+            local resolver = req_id and entry.pending_questions[req_id]
+            if not resolver then return end
+
+            log("session " .. sid_short(sid) .. ": question.rejected")
+
+            -- Unblock the keyboard side with choice=0 (rejected).
+            if entry.job then
+                a.void(function() entry.job:choice_resolve(0) end)()
+            end
+
+            -- Pass false for from_keyboard since the UI already rejected.
+            resolver(nil, false)
         end),
     })
 

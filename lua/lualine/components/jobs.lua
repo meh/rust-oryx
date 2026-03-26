@@ -23,9 +23,9 @@ local a         = require("plenary.async")
 -- Remove once things work.
 
 local function log(msg)
-    vim.schedule(function()
-        vim.notify("[jobs-lualine] " .. msg, vim.log.levels.DEBUG)
-    end)
+--    vim.schedule(function()
+--        vim.notify("[jobs-lualine] " .. msg, vim.log.levels.DEBUG)
+--    end)
 end
 
 log("module loaded")
@@ -38,6 +38,7 @@ local STATE_ICONS = {
     progress = true,        -- sentinel: use progress_icons below
     stage    = "\u{f018b}", -- nf-md-layers
     prompt   = "\u{f059}",  -- nf-fa-question_circle
+    choice   = "\u{f0295}", -- nf-md-format_list_numbered
     finished = "\u{f0132}", -- nf-md-check_circle_outline
 }
 local IDLE_ICON = "\u{f0765}" -- nf-md-circle_outline
@@ -60,6 +61,9 @@ local DEFAULT_SPECS = {
     prompt         = { type = "breathe", color = "#C800FF", period_ms = 1500 },
     prompt_accept  = { type = "static",  color = "#007A00" },
     prompt_reject  = { type = "static",  color = "#CC0000" },
+    choice         = { type = "breathe", color = "#FFD700", period_ms = 1500 },
+    choice_select  = { type = "static",  color = "#00FF64" },
+    choice_reject  = { type = "static",  color = "#CC0000" },
     finished       = { type = "static",  color = "#B4B4B4" },
 }
 
@@ -73,6 +77,9 @@ local DAEMON_KEY_MAP = {
     ["prompt-waiting"]   = "prompt",
     ["prompt-accept"]    = "prompt_accept",
     ["prompt-reject"]    = "prompt_reject",
+    ["choice-waiting"]   = "choice",
+    ["choice-select"]    = "choice_select",
+    ["choice-reject"]    = "choice_reject",
     ["finished-default"] = "finished",
 }
 
@@ -86,6 +93,7 @@ local STATE_SPEC_KEY = {
     started  = "started",
     stage    = "stage",
     prompt   = "prompt",
+    choice   = "choice",
     finished = "finished",
 }
 
@@ -253,6 +261,17 @@ local function resolve_color(info, user_specs)
         end
     end
 
+    -- Choice resolved: brief flash of select/reject color.
+    if state == "choice_resolved" then
+        local sm = info.state_metadata or {}
+        local choice_val = tonumber(sm.choice) or 0
+        if choice_val > 0 then
+            return spec_for_key("choice_select", user_specs).color
+        else
+            return spec_for_key("choice_reject", user_specs).color
+        end
+    end
+
     local spec = spec_for_state(state, user_specs)
     local opacity = anim_opacity(spec, anim_elapsed_ms)
     return apply_opacity(spec.color, opacity)
@@ -287,6 +306,17 @@ local function resolve_icon(info, user_icons)
     if state == "prompt_resolved" then
         local sm = info.state_metadata or {}
         if sm.accepted then
+            return "\u{f0132}" -- nf-md-check_circle_outline
+        else
+            return "\u{f0156}" -- nf-md-close_circle_outline
+        end
+    end
+
+    -- Choice resolved: show check/close icon briefly.
+    if state == "choice_resolved" then
+        local sm = info.state_metadata or {}
+        local choice_val = tonumber(sm.choice) or 0
+        if choice_val > 0 then
             return "\u{f0132}" -- nf-md-check_circle_outline
         else
             return "\u{f0156}" -- nf-md-close_circle_outline

@@ -168,6 +168,17 @@ struct PromptColors {
 }
 
 #[derive(Deserialize, Default, Clone)]
+struct ChoiceColors {
+    /// Color/animation while waiting for keyboard taps.
+    /// Defaults to a breathe animation at `#FFD700` (gold).
+    waiting: Option<ColorSpec>,
+    /// Pulse color when a selection is confirmed. Static only.
+    select: Option<Rgb>,
+    /// Pulse color when the choice is rejected (0 taps / timeout). Static only.
+    reject: Option<Rgb>,
+}
+
+#[derive(Deserialize, Default, Clone)]
 struct Colors {
     idle: Option<ColorSpec>,
     started: Option<ColorSpec>,
@@ -179,6 +190,8 @@ struct Colors {
     stage: StageColors,
     #[serde(default)]
     prompt: PromptColors,
+    #[serde(default)]
+    choice: ChoiceColors,
 }
 
 #[derive(Deserialize, Default)]
@@ -186,6 +199,8 @@ struct Config {
     slots: Vec<u8>,
     /// Hold duration in ms to reject a prompt (default: 1000)
     hold_ms: Option<u64>,
+    /// Idle duration in ms after the last tap to finalize a choice (default: 1500)
+    choice_idle_ms: Option<u64>,
     #[serde(default)]
     colors: Colors,
 }
@@ -215,6 +230,15 @@ enum JobState {
     },
     PromptResolved {
         accepted: bool,
+        metadata: HashMap<String, OwnedValue>,
+    },
+    Choice {
+        question: String,
+        options: u32,
+        metadata: HashMap<String, OwnedValue>,
+    },
+    ChoiceResolved {
+        choice: u32,
         metadata: HashMap<String, OwnedValue>,
     },
     Finished {
@@ -275,6 +299,15 @@ struct JobManager {
     /// 40 ms throttle window). `prompt()` drains this immediately after
     /// inserting the oneshot sender instead of blocking on it.
     pre_resolved: HashMap<u32, (bool, HashMap<String, OwnedValue>)>,
+    /// Choice responders: job_id → oneshot sender carrying (choice_index, metadata).
+    /// `choice_index` is 1-based (option selected) or 0 (rejected).
+    choice_responders: HashMap<u32, oneshot::Sender<(u32, HashMap<String, OwnedValue>)>>,
+    /// Notified whenever a choice resolves so that blocked callers can retry.
+    choice_done: Arc<Notify>,
+    /// Pre-resolved choice answers (same race-handling pattern as prompts).
+    pre_resolved_choice: HashMap<u32, (u32, HashMap<String, OwnedValue>)>,
+    /// Idle duration in ms after the last tap to finalize a choice.
+    choice_idle_ms: u64,
 }
 
 impl JobManager {
@@ -311,6 +344,10 @@ impl JobManager {
             prompt_responders: HashMap::new(),
             prompt_done: Arc::new(Notify::new()),
             pre_resolved: HashMap::new(),
+            choice_responders: HashMap::new(),
+            choice_done: Arc::new(Notify::new()),
+            pre_resolved_choice: HashMap::new(),
+            choice_idle_ms: config.choice_idle_ms.unwrap_or(1500),
         })
     }
 
@@ -470,6 +507,26 @@ impl JobManager {
     ) -> Option<oneshot::Sender<(bool, HashMap<String, OwnedValue>)>> {
         self.prompt_responders.remove(&job_id)
     }
+
+    /// Check if a key position corresponds to a slot in Choice state.
+    /// Returns (job_id, led_index, options_count) if so.
+    fn get_choice_slot(&self, col: u8, row: u8) -> Option<(u32, u8, u32)> {
+        let &slot_i = self.key_to_slot.get(&(col, row))?;
+        if let Some(JobState::Choice { options, .. }) = &self.slots[slot_i].state {
+            let job_id = self.slots[slot_i].job_id?;
+            Some((job_id, self.slots[slot_i].led, *options))
+        } else {
+            None
+        }
+    }
+
+    /// Take the choice responder oneshot sender for a job.
+    fn take_choice_responder(
+        &mut self,
+        job_id: u32,
+    ) -> Option<oneshot::Sender<(u32, HashMap<String, OwnedValue>)>> {
+        self.choice_responders.remove(&job_id)
+    }
 }
 
 // ── Color resolution ──────────────────────────────────────────────────────────
@@ -610,6 +667,29 @@ fn resolve_led_action(state: Option<&JobState>, colors: &Colors) -> LedAction {
         Some(JobState::PromptResolved { .. }) => {
             color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
         }
+        Some(JobState::Choice { .. }) => {
+            // Always animate for the choice state; default to breathe at gold.
+            let spec = match &colors.choice.waiting {
+                Some(ColorSpec::Animated(s)) => s.clone(),
+                Some(ColorSpec::Static(rgb)) => AnimSpec {
+                    animation: AnimKind::Breathe,
+                    color: Some(*rgb),
+                    colors: vec![],
+                    period_ms: None,
+                },
+                None => AnimSpec {
+                    animation: AnimKind::Breathe,
+                    color: Some(Rgb(255, 215, 0)),
+                    colors: vec![],
+                    period_ms: None,
+                },
+            };
+            LedAction::Animate(spec)
+        }
+        // ChoiceResolved is transient — same as Started.
+        Some(JobState::ChoiceResolved { .. }) => {
+            color_spec_to_action(colors.started.as_ref(), Rgb(0, 100, 255))
+        }
         Some(JobState::Finished { status: v, .. }) => {
             let cs = colors
                 .finished
@@ -661,6 +741,24 @@ fn state_to_signal(state: Option<&JobState>) -> (&'static str, HashMap<String, O
             m.insert("accepted".to_string(), OwnedValue::from(*accepted));
             ("prompt_resolved", m)
         }
+        Some(JobState::Choice {
+            question,
+            options,
+            metadata,
+        }) => {
+            let mut m = metadata.clone();
+            m.insert(
+                "question".to_string(),
+                OwnedValue::from(zbus::zvariant::Str::from(question.as_str())),
+            );
+            m.insert("options".to_string(), OwnedValue::from(*options));
+            ("choice", m)
+        }
+        Some(JobState::ChoiceResolved { choice, metadata }) => {
+            let mut m = metadata.clone();
+            m.insert("choice".to_string(), OwnedValue::from(*choice));
+            ("choice_resolved", m)
+        }
         Some(JobState::Finished { status, metadata }) => {
             let mut m = metadata.clone();
             m.insert("status".to_string(), status.clone());
@@ -688,6 +786,14 @@ enum KbdCmd {
         g: u8,
         b: u8,
         accepted: bool,
+        job_id: u32,
+    },
+    /// Trigger the select/reject pulse animation for a choice resolved externally.
+    ChoicePulse {
+        index: u8,
+        r: u8,
+        g: u8,
+        b: u8,
         job_id: u32,
     },
 }
@@ -767,6 +873,25 @@ fn prompt_waiting_variant(colors: &Colors) -> HashMap<String, OwnedValue> {
         None => anim_spec_variant(&AnimSpec {
             animation: AnimKind::Breathe,
             color: Some(Rgb(200, 0, 255)),
+            colors: vec![],
+            period_ms: None,
+        }),
+    }
+}
+
+/// Serialize the choice waiting spec, which always promotes to breathe.
+fn choice_waiting_variant(colors: &Colors) -> HashMap<String, OwnedValue> {
+    match &colors.choice.waiting {
+        Some(ColorSpec::Animated(s)) => anim_spec_variant(s),
+        Some(ColorSpec::Static(rgb)) => anim_spec_variant(&AnimSpec {
+            animation: AnimKind::Breathe,
+            color: Some(*rgb),
+            colors: vec![],
+            period_ms: None,
+        }),
+        None => anim_spec_variant(&AnimSpec {
+            animation: AnimKind::Breathe,
+            color: Some(Rgb(255, 215, 0)),
             colors: vec![],
             period_ms: None,
         }),
@@ -1153,6 +1278,192 @@ impl Jobs {
         Ok(())
     }
 
+    /// Enter choice state: LED animates until the user taps the slot key N
+    /// times to select option N, then an idle timeout finalizes the choice.
+    ///
+    /// Returns immediately. The result is delivered asynchronously via the
+    /// `State` signal with state `"choice_resolved"` and metadata
+    /// `{ choice: u32 }` (1-indexed, 0 = rejected/timeout).
+    async fn choice(
+        &self,
+        job_id: u32,
+        question: String,
+        options: u32,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let choice_metadata = metadata.clone();
+
+        let led = {
+            let mut st = self.state.lock().await;
+            let led = match st.set_state(
+                job_id,
+                JobState::Choice {
+                    question: question.clone(),
+                    options,
+                    metadata,
+                },
+            ) {
+                SetStateResult::Physical(led, action) => {
+                    send_led_action(&self.cmd_tx, led, action).await;
+                    Some(led)
+                }
+                SetStateResult::Virtual => None,
+                SetStateResult::Unknown => {
+                    return Err(zbus::fdo::Error::Failed(format!("unknown job {job_id}")));
+                }
+                SetStateResult::Unchanged => None,
+            };
+            st.choice_responders.insert(job_id, tx);
+
+            // Drain any answer that ChoiceResolve() stored before we arrived.
+            if let Some((choice_val, resolve_meta)) = st.pre_resolved_choice.remove(&job_id) {
+                let tx2 = st.choice_responders.remove(&job_id).unwrap();
+                if let Some(&slot_i) = st.job_to_slot.get(&job_id) {
+                    st.slots[slot_i].state = Some(JobState::Started {
+                        metadata: HashMap::new(),
+                    });
+                } else if let Some(vj) = st.virtual_jobs.get_mut(&job_id) {
+                    vj.state = Some(JobState::Started {
+                        metadata: HashMap::new(),
+                    });
+                }
+                let _ = tx2.send((choice_val, resolve_meta));
+                debug!(
+                    job_id,
+                    choice_val, "choice: consumed pre-resolved answer (ChoiceResolve raced ahead)"
+                );
+            }
+            drop(st);
+
+            info!(
+                job_id,
+                question, options, "choice: waiting for keyboard taps or ChoiceResolve"
+            );
+            let _ = self
+                .status_tx
+                .send((
+                    job_id,
+                    Some(JobState::Choice {
+                        question,
+                        options,
+                        metadata: choice_metadata.clone(),
+                    }),
+                ))
+                .await;
+            led
+        };
+
+        // Spawn background task to wait for the oneshot and emit the result.
+        let cmd_tx = self.cmd_tx.clone();
+        let status_tx = self.status_tx.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let (choice_val, resolve_meta) = match rx.await {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(job_id, "choice: cancelled (channel dropped)");
+                    state.lock().await.choice_done.notify_waiters();
+                    return;
+                }
+            };
+
+            if let Some(led) = led {
+                let _ = cmd_tx.send(KbdCmd::StopAnim { index: led }).await;
+            }
+
+            let mut merged = choice_metadata.clone();
+            merged.extend(resolve_meta);
+
+            let _ = status_tx
+                .send((
+                    job_id,
+                    Some(JobState::ChoiceResolved {
+                        choice: choice_val,
+                        metadata: merged,
+                    }),
+                ))
+                .await;
+
+            state.lock().await.choice_done.notify_waiters();
+            info!(job_id, choice = choice_val, "choice: resolved");
+        });
+
+        Ok(())
+    }
+
+    /// Resolve a pending choice externally (e.g. from Neovim's UI) without
+    /// requiring physical keyboard input.
+    ///
+    /// `choice` is 1-indexed (selected option) or 0 (rejected).
+    /// Returns `Ok(())` silently if the choice was already resolved.
+    async fn choice_resolve(
+        &self,
+        job_id: u32,
+        choice: u32,
+        metadata: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        let mut st = self.state.lock().await;
+
+        if !matches!(st.get_state(job_id), Some(JobState::Choice { .. })) {
+            if st.job_exists(job_id) {
+                debug!(
+                    job_id,
+                    choice, "ChoiceResolve arrived before Choice(); pre-resolving"
+                );
+                st.pre_resolved_choice.insert(job_id, (choice, metadata));
+            }
+            return Ok(());
+        }
+
+        let tx = match st.take_choice_responder(job_id) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let led = if let Some(&slot_i) = st.job_to_slot.get(&job_id) {
+            let led = st.slots[slot_i].led;
+            st.slots[slot_i].state = Some(JobState::Started {
+                metadata: HashMap::new(),
+            });
+            Some(led)
+        } else if let Some(vj) = st.virtual_jobs.get_mut(&job_id) {
+            vj.state = Some(JobState::Started {
+                metadata: HashMap::new(),
+            });
+            None
+        } else {
+            None
+        };
+
+        let pulse_color = if choice > 0 {
+            st.colors.choice.select.unwrap_or(Rgb(0, 255, 100))
+        } else {
+            st.colors.choice.reject.unwrap_or(Rgb(204, 0, 0))
+        };
+
+        let _ = tx.send((choice, metadata));
+        st.pre_resolved_choice.remove(&job_id);
+        drop(st);
+
+        info!(job_id, choice, "choice resolved via ChoiceResolve");
+
+        if let Some(led) = led {
+            let _ = self
+                .cmd_tx
+                .send(KbdCmd::ChoicePulse {
+                    index: led,
+                    r: pulse_color.0,
+                    g: pulse_color.1,
+                    b: pulse_color.2,
+                    job_id,
+                })
+                .await;
+        }
+
+        Ok(())
+    }
+
     /// Clear a finished job from software (e.g. from a UI widget).
     /// Only acts when the job is in Finished state; returns Ok(()) silently
     /// if the job is already gone or not yet finished (idempotent).
@@ -1300,6 +1611,15 @@ impl Jobs {
                 "prompt-reject".into(),
                 static_color_variant(c.prompt.reject.unwrap_or(Rgb(204, 0, 0))),
             ),
+            ("choice-waiting".into(), choice_waiting_variant(c)),
+            (
+                "choice-select".into(),
+                static_color_variant(c.choice.select.unwrap_or(Rgb(0, 255, 100))),
+            ),
+            (
+                "choice-reject".into(),
+                static_color_variant(c.choice.reject.unwrap_or(Rgb(204, 0, 0))),
+            ),
         ]))
     }
 
@@ -1321,13 +1641,19 @@ impl Jobs {
 
 impl Jobs {
     async fn update(&self, job_id: u32, state: JobState) -> zbus::fdo::Result<()> {
-        // If the job is currently in Prompt state, wait for it to resolve first.
+        // If the job is currently in Prompt or Choice state, wait for it to resolve first.
         let result = loop {
             let mut st = self.state.lock().await;
             if matches!(st.get_state(job_id), Some(JobState::Prompt { .. })) {
                 let prompt_done = Arc::clone(&st.prompt_done);
                 drop(st);
                 prompt_done.notified().await;
+                continue;
+            }
+            if matches!(st.get_state(job_id), Some(JobState::Choice { .. })) {
+                let choice_done = Arc::clone(&st.choice_done);
+                drop(st);
+                choice_done.notified().await;
                 continue;
             }
             break st.set_state(job_id, state.clone());
@@ -1402,6 +1728,8 @@ async fn keyboard_task(
     let mut animating: HashMap<u8, AnimState> = HashMap::new();
     let mut pulsing: HashMap<u8, PulseState> = HashMap::new();
     let mut keydown_times: HashMap<(u8, u8), Instant> = HashMap::new();
+    // Choice tap tracking: job_id → (tap_count, last_tap_time, led_index, options_count)
+    let mut choice_taps: HashMap<u32, (u32, Instant, u8, u32)> = HashMap::new();
 
     let mut anim_interval = tokio::time::interval(Duration::from_millis(30));
     anim_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1450,6 +1778,20 @@ async fn keyboard_task(
                             job_id,
                         });
                     }
+                    KbdCmd::ChoicePulse { index, r, g, b, job_id } => {
+                        // Triggered by ChoiceResolve — oneshot already sent, just animate.
+                        animating.remove(&index);
+                        choice_taps.remove(&job_id);
+                        pulsing.insert(index, PulseState {
+                            r,
+                            g,
+                            b,
+                            start: Instant::now(),
+                            count: 3,
+                            accepted: true,
+                            job_id,
+                        });
+                    }
                 }
             }
             result = kbd.recv_event() => {
@@ -1459,6 +1801,14 @@ async fn keyboard_task(
                         if let Some((job_id, _)) = st.get_prompt_slot(col, row) {
                             debug!(job_id, col, row, "key down on prompt slot");
                             keydown_times.insert((col, row), Instant::now());
+                        } else if let Some((job_id, led, options)) = st.get_choice_slot(col, row) {
+                            // Increment tap count for this choice slot.
+                            let entry = choice_taps
+                                .entry(job_id)
+                                .or_insert((0, Instant::now(), led, options));
+                            entry.0 += 1;
+                            entry.1 = Instant::now();
+                            debug!(job_id, taps = entry.0, options, "key down on choice slot");
                         }
                         drop(st);
                     }
@@ -1550,6 +1900,60 @@ async fn keyboard_task(
                         // Turn off the LED after pulse.
                         let _ = kbd.rgb(led, 0, 0, 0).await;
                         state.lock().await.pre_resolved.remove(&ps.job_id);
+                    }
+                }
+
+                // Check choice idle timeouts: finalize any choice whose last
+                // tap was longer ago than choice_idle_ms.
+                let mut choice_done_ids = Vec::new();
+                {
+                    let st = state.lock().await;
+                    let idle_ms = st.choice_idle_ms;
+                    for (&job_id, &(taps, last_tap, _, options)) in &choice_taps {
+                        let elapsed_ms = now.duration_since(last_tap).as_millis() as u64;
+                        if elapsed_ms >= idle_ms {
+                            // Wrap: 1-indexed, or 0 if no taps.
+                            let choice_val = if taps == 0 {
+                                0
+                            } else {
+                                ((taps - 1) % options) + 1
+                            };
+                            choice_done_ids.push((job_id, choice_val));
+                        }
+                    }
+                }
+                for (job_id, choice_val) in choice_done_ids {
+                    if let Some((_, _, led, _)) = choice_taps.remove(&job_id) {
+                        let mut st = state.lock().await;
+
+                        let select_color = st.colors.choice.select.unwrap_or(Rgb(0, 255, 100));
+                        let reject_color = st.colors.choice.reject.unwrap_or(Rgb(204, 0, 0));
+
+                        if let Some(responder) = st.take_choice_responder(job_id) {
+                            let _ = responder.send((choice_val, HashMap::new()));
+                        }
+
+                        // Transition back to Started.
+                        if let Some(&slot_i) = st.job_to_slot.get(&job_id) {
+                            st.slots[slot_i].state = Some(JobState::Started {
+                                metadata: HashMap::new(),
+                            });
+                        }
+                        drop(st);
+
+                        info!(job_id, choice = choice_val, "choice finalized by idle timeout");
+
+                        animating.remove(&led);
+                        let pc = if choice_val > 0 { select_color } else { reject_color };
+                        pulsing.insert(led, PulseState {
+                            r: pc.0,
+                            g: pc.1,
+                            b: pc.2,
+                            start: Instant::now(),
+                            count: 3,
+                            accepted: choice_val > 0,
+                            job_id,
+                        });
                     }
                 }
             }

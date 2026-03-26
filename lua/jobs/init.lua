@@ -219,6 +219,44 @@ Job.prompt_resolve = a.wrap(function(self, accepted, metadata, cb)
     get_proxy():PromptResolveAsync(function(_, _, _, _) cb() end, nil, self.id, accepted == true, make_metadata(metadata))
 end, 4)
 
+--- Enter choice state: the slot LED animates while the user taps the key N
+--- times to select option N. After an idle timeout the tap count is finalized.
+--- Async — call from within a plenary.async context (a.void / a.run).
+---
+--- The DBus Choice() call returns immediately. The result arrives via the
+--- State signal with state="choice_resolved" and metadata.choice=u32.
+--- @param question string  choice question (stored as metadata)
+--- @param options integer  number of available options (1-indexed)
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata
+--- @return integer  1-indexed option chosen, or 0 if rejected/timeout
+Job.choice = a.wrap(function(self, question, options, metadata, cb)
+    local job_id = self.id
+
+    local function on_state(sid, state_str, meta)
+        if sid == job_id and state_str == "choice_resolved" then
+            for i, c in ipairs(_callbacks) do
+                if c == on_state then
+                    table.remove(_callbacks, i)
+                    break
+                end
+            end
+            cb(meta.choice or 0)
+        end
+    end
+    table.insert(_callbacks, on_state)
+    ensure_signal()
+
+    get_proxy():ChoiceAsync(function(_, _, _, _) end, nil, job_id, question, options, make_metadata(metadata))
+end, 5)
+
+--- Resolve a pending choice externally without keyboard input.
+--- Safe to call even if the choice was already resolved by the keyboard (no-op).
+--- @param choice integer  1-indexed option chosen, or 0 to reject
+--- @param metadata table<string, string|number|boolean>?  optional extra metadata
+Job.choice_resolve = a.wrap(function(self, choice, metadata, cb)
+    get_proxy():ChoiceResolveAsync(function(_, _, _, _) cb() end, nil, self.id, choice, make_metadata(metadata))
+end, 4)
+
 -- ── Public API ────────────────────────────────────────────────────────────────
 
 local M = {}
