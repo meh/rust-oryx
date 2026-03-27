@@ -3,6 +3,15 @@ slots = [0, 1, 2]
 # How long a key must be held (ms) to reject a prompt instead of accepting it.
 hold_ms = 1000
 
+# How long (minutes) a passive job (created, started, progress, stage,
+# finished-without-timeout) can go without a state change before it is
+# automatically removed.  0 = disabled.  Default: 30.
+stale_timeout_passive = 30
+
+# Same as stale_timeout_passive but for interactive states (prompt, choice)
+# where the job is waiting for user input.  0 = disabled.  Default: 60.
+stale_timeout_active = 60
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 #
 # Every color field accepts either:

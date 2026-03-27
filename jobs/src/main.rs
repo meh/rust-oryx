@@ -201,6 +201,12 @@ struct Config {
     hold_ms: Option<u64>,
     /// Idle duration in ms after the last tap to finalize a choice (default: 1500)
     choice_idle_ms: Option<u64>,
+    /// Minutes before a passive job (created/started/progress/stage/finished)
+    /// with no state changes is auto-cleared.  0 = disabled.  Default: 30.
+    stale_timeout_passive: Option<u64>,
+    /// Minutes before an active job (prompt/choice) with no state changes
+    /// is auto-cleared.  0 = disabled.  Default: 60.
+    stale_timeout_active: Option<u64>,
     #[serde(default)]
     colors: Colors,
 }
@@ -308,6 +314,13 @@ struct JobManager {
     pre_resolved_choice: HashMap<u32, (u32, HashMap<String, OwnedValue>)>,
     /// Idle duration in ms after the last tap to finalize a choice.
     choice_idle_ms: u64,
+    /// Timestamp of the last state change or metadata update per job.
+    last_activity: HashMap<u32, Instant>,
+    /// Timeout for passive jobs (created/started/progress/stage/finished).
+    /// `Duration::ZERO` means disabled.
+    stale_timeout_passive: Duration,
+    /// Timeout for active jobs (prompt/choice). `Duration::ZERO` means disabled.
+    stale_timeout_active: Duration,
 }
 
 impl JobManager {
@@ -348,6 +361,13 @@ impl JobManager {
             choice_done: Arc::new(Notify::new()),
             pre_resolved_choice: HashMap::new(),
             choice_idle_ms: config.choice_idle_ms.unwrap_or(1500),
+            last_activity: HashMap::new(),
+            stale_timeout_passive: Duration::from_secs(
+                config.stale_timeout_passive.unwrap_or(30) * 60,
+            ),
+            stale_timeout_active: Duration::from_secs(
+                config.stale_timeout_active.unwrap_or(60) * 60,
+            ),
         })
     }
 
@@ -373,6 +393,7 @@ impl JobManager {
         self.slots[slot_i].metadata = metadata.clone();
         self.slots[slot_i].state = Some(JobState::Created { metadata });
         self.job_to_slot.insert(id, slot_i);
+        self.last_activity.insert(id, Instant::now());
         let led = self.slots[slot_i].led;
         Some((id, led))
     }
@@ -390,6 +411,7 @@ impl JobManager {
                 metadata,
             },
         );
+        self.last_activity.insert(id, Instant::now());
         id
     }
 
@@ -400,6 +422,7 @@ impl JobManager {
                 return SetStateResult::Unchanged;
             }
             self.slots[slot_i].state = Some(state.clone());
+            self.last_activity.insert(job_id, Instant::now());
             let led = self.slots[slot_i].led;
             return SetStateResult::Physical(led, resolve_led_action(Some(&state), &self.colors));
         }
@@ -409,6 +432,7 @@ impl JobManager {
                 return SetStateResult::Unchanged;
             }
             vj.state = Some(state);
+            self.last_activity.insert(job_id, Instant::now());
             return SetStateResult::Virtual;
         }
         SetStateResult::Unknown
@@ -443,10 +467,12 @@ impl JobManager {
     ) -> Option<HashMap<String, OwnedValue>> {
         if let Some(&slot_i) = self.job_to_slot.get(&job_id) {
             self.slots[slot_i].metadata.extend(updates);
+            self.last_activity.insert(job_id, Instant::now());
             return Some(self.slots[slot_i].metadata.clone());
         }
         if let Some(vj) = self.virtual_jobs.get_mut(&job_id) {
             vj.metadata.extend(updates);
+            self.last_activity.insert(job_id, Instant::now());
             return Some(vj.metadata.clone());
         }
         None
@@ -463,11 +489,13 @@ impl JobManager {
             self.slots[slot_i].metadata = HashMap::new();
             self.job_to_slot.remove(&job_id);
             self.pre_resolved.remove(&job_id);
+            self.last_activity.remove(&job_id);
             self.notify.notify_waiters();
             return Some(Some(led));
         }
         if self.virtual_jobs.remove(&job_id).is_some() {
             self.pre_resolved.remove(&job_id);
+            self.last_activity.remove(&job_id);
             return Some(None);
         }
         None
@@ -778,6 +806,9 @@ enum KbdCmd {
     StopAnim { index: u8 },
     /// Auto-clear a finished slot (timeout elapsed).
     ClearFinished { job_id: u32 },
+    /// Auto-clear a stale job that has received no state changes within the
+    /// configured timeout (works for any state, not just Finished).
+    ClearStale { job_id: u32 },
     /// Trigger the accept/reject pulse animation externally (PromptResolve path).
     /// The oneshot responder has already been sent; this is purely for the LED.
     Pulse {
@@ -1730,6 +1761,8 @@ async fn keyboard_task(
     let mut keydown_times: HashMap<(u8, u8), Instant> = HashMap::new();
     // Choice tap tracking: job_id → (tap_count, last_tap_time, led_index, options_count)
     let mut choice_taps: HashMap<u32, (u32, Instant, u8, u32)> = HashMap::new();
+    // Stale-job reaper: check every 30 seconds.
+    let mut last_reap_check = Instant::now();
 
     let mut anim_interval = tokio::time::interval(Duration::from_millis(30));
     anim_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1760,6 +1793,31 @@ async fn keyboard_task(
                                     let _ = kbd.rgb(led, 0, 0, 0).await;
                                 } else {
                                     info!(job_id, "virtual job auto-cleared by timeout");
+                                }
+                                let _ = status_tx.send((job_id, None)).await;
+                            }
+                        }
+                    }
+                    KbdCmd::ClearStale { job_id } => {
+                        let mut st = state.lock().await;
+                        // Guard: the job may have already been cleared or
+                        // transitioned since the reaper queued this command.
+                        if st.job_exists(job_id) {
+                            // Drop pending prompt/choice responders so blocked
+                            // D-Bus calls don't hang forever.
+                            st.prompt_responders.remove(&job_id);
+                            st.pre_resolved.remove(&job_id);
+                            st.choice_responders.remove(&job_id);
+                            st.pre_resolved_choice.remove(&job_id);
+                            if let Some(maybe_led) = st.force_clear(job_id) {
+                                drop(st);
+                                if let Some(led) = maybe_led {
+                                    info!(job_id, led, "stale job reaped");
+                                    animating.remove(&led);
+                                    choice_taps.remove(&job_id);
+                                    let _ = kbd.rgb(led, 0, 0, 0).await;
+                                } else {
+                                    info!(job_id, "stale virtual job reaped");
                                 }
                                 let _ = status_tx.send((job_id, None)).await;
                             }
@@ -1954,6 +2012,30 @@ async fn keyboard_task(
                             accepted: choice_val > 0,
                             job_id,
                         });
+                    }
+                }
+
+                // Stale-job reaper: scan every 30 seconds.
+                if now.duration_since(last_reap_check) >= Duration::from_secs(30) {
+                    last_reap_check = now;
+                    let st = state.lock().await;
+                    let passive = st.stale_timeout_passive;
+                    let active = st.stale_timeout_active;
+                    let mut stale_ids = Vec::new();
+                    for (&job_id, &activity) in &st.last_activity {
+                        let elapsed = now.duration_since(activity);
+                        let is_active = matches!(
+                            st.get_state(job_id),
+                            Some(JobState::Prompt { .. } | JobState::Choice { .. })
+                        );
+                        let timeout = if is_active { active } else { passive };
+                        if !timeout.is_zero() && elapsed >= timeout {
+                            stale_ids.push(job_id);
+                        }
+                    }
+                    drop(st);
+                    for job_id in stale_ids {
+                        let _ = cmd_tx.send(KbdCmd::ClearStale { job_id }).await;
                     }
                 }
             }

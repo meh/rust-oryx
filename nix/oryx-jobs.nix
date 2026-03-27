@@ -13,6 +13,8 @@ let
     {
       slots = cfg.slots;
       hold_ms = cfg.holdMs;
+      stale_timeout_passive = cfg.staleTimeoutPassive;
+      stale_timeout_active = cfg.staleTimeoutActive;
     }
     // lib.optionalAttrs (cfg.colors != { }) { colors = cfg.colors; }
   );
@@ -54,6 +56,25 @@ in
       description = ''
         Duration in milliseconds a slot key must be held to reject a prompt.
         A tap (shorter than `holdMs`) accepts; a hold rejects.
+      '';
+    };
+
+    staleTimeoutPassive = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 30;
+      description = ''
+        Minutes before a passive job (created, started, progress, stage,
+        finished-without-timeout) with no state changes is automatically
+        removed.  Set to 0 to disable.
+      '';
+    };
+
+    staleTimeoutActive = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 60;
+      description = ''
+        Minutes before an active job (prompt, choice) with no state changes
+        is automatically removed.  Set to 0 to disable.
       '';
     };
 
