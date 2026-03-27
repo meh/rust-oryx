@@ -54,6 +54,9 @@ ColumnLayout {
     property var editPromptWaiting:    loadSpec("colorPromptWaiting")
     property var editPromptAccept:     loadSpec("colorPromptAccept")
     property var editPromptReject:     loadSpec("colorPromptReject")
+    property var editChoiceWaiting:    loadSpec("colorChoiceWaiting")
+    property var editChoiceSelect:     loadSpec("colorChoiceSelect")
+    property var editChoiceReject:     loadSpec("colorChoiceReject")
 
     // ── Save ──────────────────────────────────────────────────────────────────
 
@@ -68,6 +71,9 @@ ColumnLayout {
         pluginApi.pluginSettings.colorPromptWaiting   = root.editPromptWaiting;
         pluginApi.pluginSettings.colorPromptAccept    = root.editPromptAccept;
         pluginApi.pluginSettings.colorPromptReject    = root.editPromptReject;
+        pluginApi.pluginSettings.colorChoiceWaiting   = root.editChoiceWaiting;
+        pluginApi.pluginSettings.colorChoiceSelect    = root.editChoiceSelect;
+        pluginApi.pluginSettings.colorChoiceReject    = root.editChoiceReject;
         pluginApi.saveSettings();
     }
 
@@ -176,6 +182,39 @@ ColumnLayout {
 
     NDivider { Layout.fillWidth: true }
 
+    // ── Choice ───────────────────────────────────────────────────────────
+
+    NText {
+        text: "Choice"
+        font.bold: true
+        pointSize: Style.fontSizeL
+    }
+
+    ColorSpecRow {
+        label: "Waiting"
+        spec: root.editChoiceWaiting
+        animTypeModel: root.animTypeModel
+        onSpecEdited: newSpec => root.editChoiceWaiting = newSpec
+    }
+
+    ColorSpecRow {
+        label: "Select"
+        spec: root.editChoiceSelect
+        allowAnimation: false
+        animTypeModel: root.animTypeModel
+        onSpecEdited: newSpec => root.editChoiceSelect = newSpec
+    }
+
+    ColorSpecRow {
+        label: "Reject"
+        spec: root.editChoiceReject
+        allowAnimation: false
+        animTypeModel: root.animTypeModel
+        onSpecEdited: newSpec => root.editChoiceReject = newSpec
+    }
+
+    NDivider { Layout.fillWidth: true }
+
     // ── Reset ─────────────────────────────────────────────────────────────
 
     NButton {
@@ -192,6 +231,9 @@ ColumnLayout {
             root.editPromptWaiting   = def("colorPromptWaiting");
             root.editPromptAccept    = def("colorPromptAccept");
             root.editPromptReject    = def("colorPromptReject");
+            root.editChoiceWaiting   = def("colorChoiceWaiting");
+            root.editChoiceSelect    = def("colorChoiceSelect");
+            root.editChoiceReject    = def("colorChoiceReject");
         }
     }
 

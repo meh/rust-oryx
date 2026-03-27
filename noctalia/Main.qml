@@ -68,6 +68,7 @@ Item {
         "started":  "colorStarted",
         "stage":    "colorStageDefault",
         "prompt":   "colorPromptWaiting",
+        "choice":   "colorChoiceWaiting",
         "finished": "colorFinishedDefault"
     })
 
@@ -258,6 +259,8 @@ Item {
             return colorSpec("colorStageDefault").color;
         case "prompt":
             return colorSpec("colorPromptWaiting").color;
+        case "choice":
+            return colorSpec("colorChoiceWaiting").color;
         case "finished":
             return colorSpec("colorFinishedDefault").color;
         default:
@@ -272,6 +275,7 @@ Item {
         case "progress":       return "progress";
         case "stage":          return "stack-2";
         case "prompt":         return "question-mark";
+        case "choice":         return "list-numbers";
         case "finished":       return "circle-check";
         default:               return "circle";
         }
@@ -347,9 +351,11 @@ Item {
         switch (state) {
         case "progress":       delete meta.current; delete meta.total; break;
         case "stage":          delete meta.name; break;
-        case "prompt":         delete meta.question; break;
+        case "prompt":          delete meta.question; break;
         case "prompt_resolved": delete meta.accepted; break;
-        case "finished":       delete meta.status; break;
+        case "choice":          delete meta.question; delete meta.options; break;
+        case "choice_resolved": delete meta.choice; break;
+        case "finished":        delete meta.status; break;
         // created, started: entire dict is metadata
         }
         return meta;
@@ -420,6 +426,21 @@ Item {
             return;
         }
 
+        // "choice_resolved" is transient; transition the job back to started.
+        if (state === "choice_resolved") {
+            var crExisting = jobs[jobId];
+            if (crExisting) {
+                var crResolved = Object.assign({}, jobs);
+                var crJob = Object.assign({}, crExisting);
+                crJob.state = "started";
+                crJob.stateMetadata = extractStateMetadata("choice_resolved", dict);
+                crJob.metadata = Object.assign({}, crJob.creationMetadata, crJob.stateMetadata);
+                crResolved[jobId] = crJob;
+                jobs = crResolved;
+            }
+            return;
+        }
+
         // Build or update the job entry
         var job = Object.assign({}, jobs[jobId] || {
             state: "",
@@ -430,6 +451,8 @@ Item {
             total: 0,
             stageName: "",
             promptText: "",
+            choiceQuestion: "",
+            choiceOptions: 0,
             finishedValue: null
         });
 
@@ -446,6 +469,9 @@ Item {
         } else if (state === "prompt") {
             job.promptText = dict.question || "";
             showPromptOverlay(parseInt(jobId), job.promptText);
+        } else if (state === "choice") {
+            job.choiceQuestion = dict.question || "";
+            job.choiceOptions = dict.options !== undefined ? parseInt(dict.options) : 0;
         } else if (state === "finished") {
             job.finishedValue = dict.status !== undefined ? dict.status : null;
         }
@@ -539,6 +565,8 @@ Item {
                 total: 0,
                 stageName: "",
                 promptText: "",
+                choiceQuestion: "",
+                choiceOptions: 0,
                 finishedValue: null
             };
 
@@ -551,6 +579,9 @@ Item {
             } else if (state === "prompt") {
                 job.promptText = stateDict.question || "";
                 showPromptOverlay(parseInt(jobId), job.promptText);
+            } else if (state === "choice") {
+                job.choiceQuestion = stateDict.question || "";
+                job.choiceOptions = stateDict.options !== undefined ? parseInt(stateDict.options) : 0;
             } else if (state === "finished") {
                 job.finishedValue = stateDict.status !== undefined ? stateDict.status : null;
             }
@@ -600,6 +631,60 @@ Item {
         }
     }
 
+    // ── D-Bus name-owner watcher ────────────────────────────────────────────
+    // Detects when the daemon's well-known name appears or disappears so we
+    // can clear stale state immediately on daemon death and re-fetch on restart.
+
+    Process {
+        id: nameWatchProcess
+        command: [
+            "busctl", "--user", "--json=short", "monitor",
+            "--match", "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='zsa.oryx.Jobs'"
+        ]
+        running: true
+
+        onRunningChanged: {
+            if (!running)
+                nameWatchReconnect.restart();
+        }
+
+        stdout: SplitParser {
+            onRead: line => root.parseNameOwnerChanged(line)
+        }
+    }
+
+    Timer {
+        id: nameWatchReconnect
+        interval: 2000
+        repeat: false
+        onTriggered: nameWatchProcess.running = true
+    }
+
+    function parseNameOwnerChanged(line) {
+        var msg;
+        try { msg = JSON.parse(line); } catch (e) { return; }
+        if (msg.type !== "signal") return;
+        if (msg.member !== "NameOwnerChanged") return;
+
+        var data = msg.payload?.data;
+        if (!Array.isArray(data) || data.length < 3) return;
+
+        var oldOwner = data[1];
+        var newOwner = data[2];
+
+        // Old owner departed — daemon died.  Clear all state.
+        if (oldOwner && oldOwner !== "") {
+            jobs = ({});
+            hidePromptOverlay();
+        }
+
+        // New owner appeared — daemon (re)started.  Re-fetch everything.
+        if (newOwner && newOwner !== "") {
+            fetchDaemonColors();
+            fetchJobs();
+        }
+    }
+
     // ── One-shot call process ─────────────────────────────────────────────────
 
     Process { id: callProcess }
@@ -612,6 +697,16 @@ Item {
             "zsa.oryx.Jobs", "/zsa/oryx/Jobs", "zsa.oryx.Jobs",
             "PromptResolve", "uba{sv}",
             jobId.toString(), accepted ? "true" : "false",
+            "0"
+        ]);
+    }
+
+    function choiceResolve(jobId, choice) {
+        callProcess.exec([
+            "busctl", "--user", "call",
+            "zsa.oryx.Jobs", "/zsa/oryx/Jobs", "zsa.oryx.Jobs",
+            "ChoiceResolve", "uua{sv}",
+            jobId.toString(), choice.toString(),
             "0"
         ]);
     }

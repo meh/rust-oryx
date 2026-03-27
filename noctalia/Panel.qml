@@ -12,8 +12,8 @@ Item {
     readonly property var geometryPlaceholder: panelContainer
     readonly property bool allowAttach: true
 
-    // Content-driven sizing: width fixed, height tracks content (capped).
-    property real contentPreferredWidth: 400 * Style.uiScaleRatio
+    // Content-driven sizing: both dimensions track content, capped by screen.
+    property real contentPreferredWidth: Math.max(360 * Style.uiScaleRatio, contentColumn.implicitWidth + Style.margin2M)
     property real contentPreferredHeight: contentColumn.implicitHeight + Style.margin2L
 
     readonly property var mainRef: pluginApi?.mainInstance ?? null
@@ -67,6 +67,7 @@ Item {
                             : "#888888"
 
                         Layout.fillWidth: true
+                        implicitWidth: cardContent.implicitWidth + Style.marginM * 2
                         implicitHeight: cardContent.implicitHeight + Style.marginM * 2
                         radius: Style.radiusM
                         color: Style.capsuleColor
@@ -161,7 +162,7 @@ Item {
                                         color: Color.mOnSurface
                                         pointSize: Style.fontSizeS
                                         Layout.fillWidth: true
-                                        wrapMode: Text.Wrap
+                                        elide: Text.ElideRight
                                     }
                                 }
                             }
@@ -260,6 +261,46 @@ Item {
                                             onClicked: {
                                                 if (mainRef)
                                                     mainRef.promptResolve(jobCard.jobId, true);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ── Choice: question + options count + reject ─
+                            Loader {
+                                active: jobCard.jobState === "choice"
+                                Layout.fillWidth: true
+                                sourceComponent: ColumnLayout {
+                                    spacing: Style.marginS
+
+                                    NText {
+                                        text: jobCard.modelData.choiceQuestion || ""
+                                        color: Color.mOnSurface
+                                        pointSize: Style.fontSizeS
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.WordWrap
+                                    }
+
+                                    NText {
+                                        text: (jobCard.modelData.choiceOptions || 0) + " options — tap key to choose"
+                                        color: Color.mOnSurface
+                                        opacity: 0.5
+                                        pointSize: Style.fontSizeXS
+                                    }
+
+                                    RowLayout {
+                                        spacing: Style.marginS
+
+                                        NButton {
+                                            text: "Reject"
+                                            fontSize: Style.fontSizeS
+                                            backgroundColor: Color.mError
+                                            textColor: Color.mOnError
+                                            implicitHeight: 28 * Style.uiScaleRatio
+                                            onClicked: {
+                                                if (mainRef)
+                                                    mainRef.choiceResolve(jobCard.jobId, 0);
                                             }
                                         }
                                     }

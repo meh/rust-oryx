@@ -36,5 +36,18 @@
   "colorPromptReject": {
     "type": "static",
     "color": "#FF0000"
+  },
+  "colorChoiceWaiting": {
+    "type": "breathe",
+    "color": "#dddddd",
+    "periodMs": 1500
+  },
+  "colorChoiceSelect": {
+    "type": "static",
+    "color": "#00FF00"
+  },
+  "colorChoiceReject": {
+    "type": "static",
+    "color": "#FF0000"
   }
 }

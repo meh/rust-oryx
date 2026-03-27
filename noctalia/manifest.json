@@ -25,7 +25,10 @@
       "colorStageDefault": { "type": "static", "color": "#FFC800" },
       "colorPromptWaiting": { "type": "breathe", "color": "#C800FF", "periodMs": 1500 },
       "colorPromptAccept": { "type": "static", "color": "#007A00" },
-      "colorPromptReject": { "type": "static", "color": "#CC0000" }
+      "colorPromptReject": { "type": "static", "color": "#CC0000" },
+      "colorChoiceWaiting": { "type": "breathe", "color": "#FFD700", "periodMs": 1500 },
+      "colorChoiceSelect": { "type": "static", "color": "#00FF64" },
+      "colorChoiceReject": { "type": "static", "color": "#CC0000" }
     }
   }
 }
