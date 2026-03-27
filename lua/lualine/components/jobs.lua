@@ -410,6 +410,43 @@ local function subscribe(user_specs)
 
     jobs.on_state(state_callback)
     jobs.on_metadata(meta_callback)
+
+    -- React to daemon disappearing / reappearing on the session bus.
+    jobs.on_disconnect(function()
+        log("on_disconnect: daemon vanished, clearing cache")
+        jobs_cache = {}
+        daemon_specs = nil
+        stop_anim_timer()
+        schedule_refresh()
+    end)
+
+    jobs.on_connect(function()
+        log("on_connect: daemon appeared, re-fetching state")
+        a.void(function()
+            local colors = jobs.get_colors()
+            if colors then
+                daemon_specs = {}
+                for daemon_key, spec in pairs(colors) do
+                    local our_key = DAEMON_KEY_MAP[daemon_key]
+                    if our_key then
+                        daemon_specs[our_key] = spec
+                    end
+                end
+            end
+
+            local all = jobs.get_jobs()
+            if all then
+                for id, info in pairs(all) do
+                    if not jobs_cache[id] then
+                        jobs_cache[id] = info
+                    end
+                end
+                sync_anim_timer(user_specs)
+                schedule_refresh()
+            end
+        end)()
+    end)
+
     subscribed = true
     log("subscribe: signals connected")
 
@@ -535,6 +572,7 @@ function component:update_status()
         return ""
     end
 
+    local default_hl = self:get_default_hl()
     local parts = {}
     for _, entry in ipairs(jobs_list) do
         local info  = entry.info
@@ -546,7 +584,9 @@ function component:update_status()
         slot_colors[slot] = color
         ensure_slot_hl(self, slot)
         local hl = self:format_hl(self._slot_hls[slot])
-        parts[#parts + 1] = hl .. icon
+        -- Reset to the section default after the icon so the separator
+        -- between icons doesn't inherit this icon's color.
+        parts[#parts + 1] = hl .. icon .. default_hl
     end
 
     local result = table.concat(parts, self.icon_sep)
