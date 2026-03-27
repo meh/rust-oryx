@@ -24,7 +24,10 @@
 
 local a          = require("plenary.async")
 local dbus_proxy = require("dbus_proxy")
-local GLib       = require("lgi").GLib
+local lgi        = require("lgi")
+local GLib       = lgi.GLib
+local Gio        = lgi.Gio
+local GObject    = lgi.GObject
 
 -- ── internals ─────────────────────────────────────────────────────────────────
 
@@ -36,6 +39,21 @@ local _proxy     = nil
 local _callbacks = {}
 local _timer     = nil
 local _connected = false
+
+-- Metadata signal state (declared early so name-watcher can reference them).
+local _metadata_callbacks = {}
+local _metadata_connected = false
+
+-- D-Bus name watcher state.
+local _name_watcher_started     = false
+local _connect_callbacks        = {}
+local _disconnect_callbacks     = {}
+
+-- Unwrap a GLib a{sv} variant into a plain Lua table.
+local function strip_meta(raw)
+    if not raw then return {} end
+    return dbus_proxy.variant.strip(raw)
+end
 
 -- Start pumping the GLib main context from Neovim's libuv loop so that
 -- DBus async call callbacks and signal callbacks are processed promptly.
@@ -67,6 +85,75 @@ local function get_proxy()
     return _proxy
 end
 
+-- Re-subscribe D-Bus signals on a fresh proxy.  Called after the daemon
+-- restarts and a new proxy has been created via get_proxy().
+local function resubscribe_signals()
+    local p = get_proxy()
+    if not p then return end
+
+    if not _connected and #_callbacks > 0 then
+        p:connect_signal(function(_, job_id, state_str, raw_meta)
+            local meta = strip_meta(raw_meta)
+            vim.schedule(function()
+                for _, cb in ipairs(_callbacks) do
+                    pcall(cb, job_id, state_str, meta)
+                end
+            end)
+        end, "StateChanged")
+        _connected = true
+    end
+
+    if not _metadata_connected and #_metadata_callbacks > 0 then
+        p:connect_signal(function(_, job_id, raw_meta)
+            local meta = strip_meta(raw_meta)
+            vim.schedule(function()
+                for _, cb in ipairs(_metadata_callbacks) do
+                    pcall(cb, job_id, meta)
+                end
+            end)
+        end, "MetadataChanged")
+        _metadata_connected = true
+    end
+end
+
+-- Watch the well-known D-Bus name so we detect daemon death/restart.
+local function start_name_watcher()
+    if _name_watcher_started then return end
+    _name_watcher_started = true
+
+    Gio.bus_watch_name(
+        Gio.BusType.SESSION,
+        DEST,
+        Gio.BusNameWatcherFlags.NONE,
+        -- name appeared
+        GObject.Closure(function()
+            -- Invalidate the old proxy so get_proxy() creates a fresh one.
+            _proxy = nil
+            _connected = false
+            _metadata_connected = false
+            vim.schedule(function()
+                -- Re-subscribe signals on the new proxy before notifying
+                -- consumers, so they can rely on signals working immediately.
+                resubscribe_signals()
+                for _, cb in ipairs(_connect_callbacks) do
+                    pcall(cb)
+                end
+            end)
+        end),
+        -- name vanished
+        GObject.Closure(function()
+            _proxy = nil
+            _connected = false
+            _metadata_connected = false
+            vim.schedule(function()
+                for _, cb in ipairs(_disconnect_callbacks) do
+                    pcall(cb)
+                end
+            end)
+        end)
+    )
+end
+
 -- Build a plain Lua table of GLib.Variant values from a flat Lua table.
 -- dbus_proxy reads the `a{sv}` signature from DBus introspection and passes
 -- this table to lgi's variant builder, which calls Variant.new_variant() on
@@ -94,12 +181,6 @@ local function make_metadata(t)
         end
     end
     return entries
-end
-
--- Unwrap a GLib a{sv} variant into a plain Lua table.
-local function strip_meta(raw)
-    if not raw then return {} end
-    return dbus_proxy.variant.strip(raw)
 end
 
 -- Connect the State signal once, routing to all registered callbacks.
@@ -322,6 +403,7 @@ function M.on_state(callback)
     table.insert(_callbacks, callback)
     ensure_timer()
     ensure_signal()
+    start_name_watcher()
 end
 
 --- Unsubscribe a previously registered callback.
@@ -336,9 +418,6 @@ function M.off_state(callback)
 end
 
 -- ── MetadataChanged signal ────────────────────────────────────────────────────
-
-local _metadata_callbacks = {}
-local _metadata_connected = false
 
 local function ensure_metadata_signal()
     if _metadata_connected then return end
@@ -361,6 +440,7 @@ function M.on_metadata(callback)
     table.insert(_metadata_callbacks, callback)
     ensure_timer()
     ensure_metadata_signal()
+    start_name_watcher()
 end
 
 --- Unsubscribe a previously registered metadata callback.
@@ -369,6 +449,46 @@ function M.off_metadata(callback)
     for i, cb in ipairs(_metadata_callbacks) do
         if cb == callback then
             table.remove(_metadata_callbacks, i)
+            return
+        end
+    end
+end
+
+-- ── D-Bus name lifecycle callbacks ───────────────────────────────────────────
+
+--- Register a callback invoked when the daemon's D-Bus name appears.
+--- @param callback fun()
+function M.on_connect(callback)
+    table.insert(_connect_callbacks, callback)
+    ensure_timer()
+    start_name_watcher()
+end
+
+--- Unregister a connect callback.
+--- @param callback fun()
+function M.off_connect(callback)
+    for i, cb in ipairs(_connect_callbacks) do
+        if cb == callback then
+            table.remove(_connect_callbacks, i)
+            return
+        end
+    end
+end
+
+--- Register a callback invoked when the daemon's D-Bus name vanishes.
+--- @param callback fun()
+function M.on_disconnect(callback)
+    table.insert(_disconnect_callbacks, callback)
+    ensure_timer()
+    start_name_watcher()
+end
+
+--- Unregister a disconnect callback.
+--- @param callback fun()
+function M.off_disconnect(callback)
+    for i, cb in ipairs(_disconnect_callbacks) do
+        if cb == callback then
+            table.remove(_disconnect_callbacks, i)
             return
         end
     end
